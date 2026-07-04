@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
 use std::path::PathBuf;
 
 pub const BASE: &str = "https://livetiming.formula1.com/static";
@@ -19,32 +18,31 @@ pub const TOPICS: &[&str] = &[
     "Position.z",
 ];
 
-#[derive(Debug, Deserialize)]
-pub struct YearIndex {
-    #[serde(rename = "Meetings")]
-    pub meetings: Vec<Meeting>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Meeting {
-    #[serde(rename = "Name")]
-    pub name: String,
-    #[serde(rename = "Location", default)]
-    pub location: String,
-    #[serde(rename = "Sessions")]
-    pub sessions: Vec<Session>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
+/// A replayable session, reconstructed from the Jolpica schedule.
+#[derive(Debug, Clone)]
 pub struct Session {
-    #[serde(rename = "Key")]
-    pub key: i64,
-    #[serde(rename = "Name")]
     pub name: String,
-    #[serde(rename = "StartDate", default)]
     pub start_date: String,
-    #[serde(rename = "Path", default)]
     pub path: Option<String>,
+    /// Directory name for this session's on-disk stream cache.
+    pub cache_id: String,
+}
+
+impl Session {
+    /// Build a session from a schedule-reconstructed archive path.
+    pub fn reconstructed(
+        cache_id: String,
+        name: String,
+        start_date: String,
+        path: String,
+    ) -> Self {
+        Session {
+            name,
+            start_date,
+            path: Some(path),
+            cache_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -72,32 +70,68 @@ impl Archive {
         })
     }
 
-    pub async fn year_index(&self, year: u16) -> Result<YearIndex> {
-        let url = format!("{BASE}/{year}/Index.json");
-        let body = self.client.get(&url).send().await?.error_for_status()?.text().await?;
-        Ok(serde_json::from_str(strip_bom(&body))?)
+    /// The shared HTTP client, for callers that fetch other resources (schedule).
+    pub fn http(&self) -> &reqwest::Client {
+        &self.client
     }
 
-    /// Find sessions whose meeting + session name matches every query word.
-    pub async fn find_sessions(&self, year: u16, query: &[String]) -> Result<Vec<SessionRef>> {
-        let index = self.year_index(year).await?;
-        let mut found = Vec::new();
-        for meeting in index.meetings {
-            for session in &meeting.sessions {
-                if session.path.is_none() {
-                    continue; // not yet archived (future session)
+    /// The root cache directory (`sessions/`, `schedules/`, `circuits/` live here).
+    pub fn cache_dir(&self) -> &std::path::Path {
+        &self.cache_dir
+    }
+
+    /// Disk usage per cache category, in bytes: (sessions, schedules, circuits).
+    pub fn cache_usage(&self) -> CacheUsage {
+        CacheUsage {
+            sessions: dir_size(&self.cache_dir.join("sessions")),
+            schedules: dir_size(&self.cache_dir.join("schedules")),
+            circuits: dir_size(&self.cache_dir.join("circuits")),
+        }
+    }
+
+    /// Delete cached data. With `year`, only that season's session streams (whose
+    /// cache ids are prefixed `{year}-`) are removed; the schedule and circuit
+    /// caches are shared and left alone. Without a year, wipe everything.
+    /// Returns the number of bytes freed.
+    pub fn clear_cache(&self, year: Option<u16>) -> Result<u64> {
+        match year {
+            None => {
+                let freed = dir_size(&self.cache_dir);
+                for sub in ["sessions", "schedules", "circuits"] {
+                    let path = self.cache_dir.join(sub);
+                    if path.exists() {
+                        std::fs::remove_dir_all(&path)
+                            .with_context(|| format!("removing {}", path.display()))?;
+                    }
                 }
-                let hay = format!("{} {} {}", meeting.name, meeting.location, session.name)
-                    .to_lowercase();
-                if query.iter().all(|w| hay.contains(&w.to_lowercase())) {
-                    found.push(SessionRef {
-                        meeting: meeting.name.clone(),
-                        session: session.clone(),
-                    });
+                Ok(freed)
+            }
+            Some(year) => {
+                let sessions = self.cache_dir.join("sessions");
+                let prefix = format!("{year}-");
+                let mut freed = 0;
+                let entries = match std::fs::read_dir(&sessions) {
+                    Ok(e) => e,
+                    Err(_) => return Ok(0),
+                };
+                for entry in entries.flatten() {
+                    if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                        let path = entry.path();
+                        freed += dir_size(&path);
+                        std::fs::remove_dir_all(&path)
+                            .with_context(|| format!("removing {}", path.display()))?;
+                    }
                 }
+                Ok(freed)
             }
         }
-        Ok(found)
+    }
+
+    /// On-disk cache location for a season's Jolpica schedule.
+    pub fn schedule_cache_file(&self, year: u16) -> PathBuf {
+        self.cache_dir
+            .join("schedules")
+            .join(format!("{year}.json"))
     }
 
     /// Download one topic stream for a session, using the on-disk cache.
@@ -110,7 +144,7 @@ impl Archive {
         let cache_file = self
             .cache_dir
             .join("sessions")
-            .join(session.key.to_string())
+            .join(&session.cache_id)
             .join(format!("{topic}.jsonStream"));
         if let Ok(cached) = std::fs::read_to_string(&cache_file) {
             return Ok(Some(cached));
@@ -154,4 +188,33 @@ impl Archive {
 
 pub fn strip_bom(s: &str) -> &str {
     s.trim_start_matches('\u{feff}')
+}
+
+/// Cache disk usage broken down by category, in bytes.
+pub struct CacheUsage {
+    pub sessions: u64,
+    pub schedules: u64,
+    pub circuits: u64,
+}
+
+impl CacheUsage {
+    pub fn total(&self) -> u64 {
+        self.sessions + self.schedules + self.circuits
+    }
+}
+
+/// Total size in bytes of all files under `dir`, recursively. Missing dir → 0.
+fn dir_size(dir: &std::path::Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => total += dir_size(&entry.path()),
+            Ok(_) => total += entry.metadata().map(|m| m.len()).unwrap_or(0),
+            Err(_) => {}
+        }
+    }
+    total
 }

@@ -36,9 +36,16 @@ boxbox live                        # connect to the live feed (during sessions)
 boxbox replay bahrain race         # replay any archived session
 boxbox replay monaco qualifying --year 2024 --speed 2
 boxbox replay silverstone race --start-at 01:05:00
-boxbox sessions                    # list this season's archived sessions
-boxbox sessions --year 2023
+boxbox replay                      # no args: browse year → race → session
+boxbox replay --list --year 2024   # print the season schedule
 ```
+
+A query resolves against the full season schedule: a unique match (e.g.
+`monaco qualifying`, `silverstone race`) plays immediately, anything ambiguous
+drops into the browser pre-filtered by what you typed. Matching covers race
+name, circuit, city, and country, plus a few nicknames (`britain`/`uk`, `cota`,
+`vegas`, `holland`, …). `replay --list` and the browser share this one source,
+so the listing and the picker always agree.
 
 Replay downloads a session's timing streams once and caches them locally
 (`~/Library/Caches/boxbox` on macOS, XDG cache dir on Linux), so re-watching

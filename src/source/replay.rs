@@ -58,6 +58,21 @@ pub async fn load_session(
     Ok(entries)
 }
 
+/// Timestamp of the green flag: the first `SessionStatus` transition to
+/// "Started". Replays default to seeking here so the viewer lands on racing
+/// rather than the long pre-session grid/formation window (which stays in the
+/// timeline and is still reachable by rewinding). `None` for sessions that
+/// never report a start (e.g. an incomplete stream).
+pub fn green_flag(entries: &[ReplayEntry]) -> Option<Duration> {
+    entries
+        .iter()
+        .find(|e| {
+            e.topic == "SessionStatus"
+                && e.data.get("Status").and_then(Value::as_str) == Some("Started")
+        })
+        .map(|e| e.ts)
+}
+
 /// Play entries in sim time. Speed/pause/jump arrive on `ctrl`.
 /// Messages skipped by a jump are still sent (instantly) so state stays correct.
 pub async fn play(
@@ -109,6 +124,13 @@ pub async fn play(
                 let gap = next_ts - sim_t;
                 Duration::from_secs_f64((gap.as_secs_f64() / speed).min(0.25))
             };
+            // At high speed the remaining gap can round below timer resolution,
+            // leaving sim_t a few ns short of next_ts forever (busy-spin). Snap
+            // to next_ts and emit the message instead of sleeping on ~zero.
+            if !paused && wait.is_zero() {
+                sim_t = next_ts;
+                break;
+            }
             tokio::select! {
                 cmd = ctrl.recv() => match cmd {
                     Some(PlaybackControl::SetSpeed(s)) => speed = s.max(0.1),
@@ -157,5 +179,36 @@ pub async fn play(
             last_clock = sim_t;
             let _ = tx.send(SourceEvent::Clock(sim_t));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn entry(secs: u64, topic: &'static str, data: Value) -> ReplayEntry {
+        ReplayEntry { ts: Duration::from_secs(secs), topic, data }
+    }
+
+    #[test]
+    fn green_flag_finds_first_started() {
+        let entries = vec![
+            entry(6, "SessionStatus", json!({"Status": "Inactive"})),
+            entry(100, "TimingData", json!({"Lines": {}})),
+            entry(3334, "SessionStatus", json!({"Status": "Started"})),
+            entry(9000, "SessionStatus", json!({"Status": "Finished"})),
+        ];
+        assert_eq!(green_flag(&entries), Some(Duration::from_secs(3334)));
+    }
+
+    #[test]
+    fn green_flag_none_when_never_started() {
+        // Practice/incomplete streams never report a race start.
+        let entries = vec![
+            entry(6, "SessionStatus", json!({"Status": "Inactive"})),
+            entry(100, "TimingData", json!({"Lines": {}})),
+        ];
+        assert_eq!(green_flag(&entries), None);
     }
 }

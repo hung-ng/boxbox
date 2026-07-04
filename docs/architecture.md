@@ -17,8 +17,23 @@ draining the channel each frame (~30 fps).
 
 ## Modules
 
-- `src/main.rs` — clap CLI (`live`, `replay <query> [--year --speed --start-at]`,
-  `sessions [--year]`), session resolution, wiring channels/runtime to the UI.
+- `src/main.rs` — clap CLI (`live`, `replay <query> [--year --speed --start-at
+  --list]`, `cache <path|info|clear [--year]>`), session resolution, wiring
+  channels/runtime to the UI. There are three verbs: `live`, `replay`, and
+  `cache`. `default_year()` is `chrono::Utc::now().year()`. Everything replay
+  does is backed by one source, the Jolpica schedule (`schedule.rs`):
+  - `resolve_session` — with a query, builds the match set (widened haystack +
+    nickname aliases); exactly one *available* session → plays it directly, else
+    hands off to the browser pre-filtered by the query. Empty query → full browser.
+  - `browse` — interactive race → session picker; future sessions
+    (`session.date > today`) are shown dimmed and can't be selected.
+  - `print_schedule` — `replay --list`, prints the schedule (replaces the old
+    `sessions` verb). Same source as the browser, so list and picker agree.
+    The live `Index.json` is no longer used for discovery; Jolpica is unified.
+  - `run_cache` — `cache path/info/clear`. `info` reports per-category disk
+    usage (sessions/schedules/circuits) via `Archive::cache_usage`; `clear`
+    wipes everything, or with `--year` only that season's session streams
+    (their `cache_id`s are `{year}-`-prefixed). `fmt_bytes` humanizes sizes.
 - `src/message.rs` — `FeedMessage`, `SourceEvent` (Message/Info/Clock/Circuit/Ended),
   `PlaybackControl` (SetSpeed/TogglePause/Jump).
 
@@ -48,10 +63,27 @@ draining the channel each frame (~30 fps).
 ### Sources (`src/source/`)
 
 - `archive.rs` — static archive client for `livetiming.formula1.com/static`:
-  year index (`/{year}/Index.json`), per-topic `.jsonStream` files, on-disk
-  cache under the platform cache dir. Responses are BOM-prefixed — always
-  `strip_bom`. Missing topics return 403 *or* 404; both mean "not available".
-  Also fetches circuit outlines from `api.multiviewer.app` (cached).
+  per-topic `.jsonStream` files, on-disk cache under the platform cache dir.
+  Responses are BOM-prefixed — always `strip_bom`. Missing topics return 403
+  *or* 404; both mean "not available". Also fetches circuit outlines from
+  `api.multiviewer.app` (cached). `Session` is schedule-reconstructed (no index):
+  `Session::reconstructed(...)` builds one from a path, with a `cache_id` naming
+  its on-disk stream cache. (Discovery no longer reads `Index.json`.) Cache
+  management: `cache_dir()`, `cache_usage() -> CacheUsage` (recursive `dir_size`
+  over `sessions/`, `schedules/`, `circuits/`), and `clear_cache(Option<year>)`.
+- `schedule.rs` — full-season schedule from Jolpica (`api.jolpi.ca/ergast/f1`),
+  cached on disk, the **single discovery source** for replay. F1's own
+  `Index.json` is **trimmed for past seasons** (early rounds vanish) even though
+  their streams stay on the server. Jolpica gives the complete schedule with
+  per-session dates, from which we **reconstruct the archive path**:
+  `{year}/{race_date}_{Meeting_Name}/{session_date}_{Session_Name}/` — meeting
+  folder uses the race (Sunday) date, each session folder its own date, names are
+  spaces→underscores with UTF-8 preserved (`São_Paulo_Grand_Prix`). Sprint
+  weekends emit Sprint Qualifying/Sprint in chronological order. Query matching
+  lives here too: `ScheduledRace::haystack` (race name + circuit id + locality +
+  country), an `ALIASES`/`expand_query` nickname layer, `is_available(today)` for
+  the future-session gate, and a shared `matches(expanded)` used by both the
+  direct resolver and the browser.
 - `replay.rs` — parses `.jsonStream` lines (`HH:MM:SS.mmm{json}` — 12-char
   timestamp prefix), merge-sorts all topics by offset, and plays them back in
   sim time. Pause/speed/jump arrive via a tokio mpsc control channel; jumps

@@ -3,7 +3,7 @@ mod source;
 mod state;
 mod ui;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use source::archive::Archive;
 use std::time::Duration;
@@ -19,35 +19,55 @@ struct Cli {
 enum Command {
     /// Connect to the live timing feed (only active during sessions)
     Live,
-    /// Replay an archived session, e.g. `boxbox replay bahrain race`
+    /// Replay an archived session, e.g. `boxbox replay monaco race` or
+    /// `boxbox replay sao-paulo qualifying`. No args opens an interactive
+    /// browser; `--list` prints the schedule. Pick a season with `--year`.
     Replay {
-        /// Words matching the meeting/session, e.g. "monaco qualifying"
+        /// Race/session tokens, e.g. "monaco qualifying" or "sao-paulo race".
+        /// Dash multi-word names (las-vegas, red-bull-ring); tokens are matched
+        /// whole, so a partial word like "silvers" won't hit "silverstone".
         query: Vec<String>,
-        /// Season year
+        /// Season year, e.g. `--year 2023`. The year is chosen here, never as a
+        /// query token — `replay monaco 2023` looks for a race called "2023".
         #[arg(long, default_value_t = default_year())]
         year: u16,
         /// Playback speed multiplier
         #[arg(long, default_value_t = 1.0)]
         speed: f64,
-        /// Start offset into the recording (HH:MM:SS or MM:SS)
+        /// Start offset into the recording (HH:MM:SS or MM:SS). Default: the
+        /// green flag, skipping the pre-session; pass 0:00 for the full grid.
         #[arg(long)]
         start_at: Option<String>,
+        /// Print the season schedule and exit
+        #[arg(long)]
+        list: bool,
     },
-    /// List archived sessions for a season
-    Sessions {
-        /// Season year
-        #[arg(long, default_value_t = default_year())]
-        year: u16,
+    /// Inspect or clear the on-disk download cache (session streams, schedules,
+    /// circuit outlines).
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Print the cache directory path
+    Path,
+    /// Show cache size on disk, broken down by category
+    Info,
+    /// Delete cached data. Without `--year`, wipes everything; with `--year`,
+    /// removes only that season's cached session streams.
+    Clear {
+        /// Limit the clear to one season's session streams
+        #[arg(long)]
+        year: Option<u16>,
     },
 }
 
 fn default_year() -> u16 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    1970 + (secs / 31_557_600) as u16
+    use chrono::Datelike;
+    chrono::Utc::now().year() as u16
 }
 
 fn main() -> Result<()> {
@@ -55,24 +75,24 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     match cli.command {
-        Command::Sessions { year } => rt.block_on(list_sessions(year)),
         Command::Live => {
             let (tx, rx) = std::sync::mpsc::channel();
             rt.spawn(source::live::run(tx.clone()));
             ui::run(rx, tx, None, rt.handle().clone(), 1.0)
         }
+        Command::Replay { year, list: true, .. } => rt.block_on(print_schedule(year)),
         Command::Replay {
             query,
             year,
             speed,
             start_at,
+            list: false,
         } => {
-            if query.is_empty() {
-                bail!("give me something to find, e.g. `boxbox replay bahrain race`");
-            }
-            let start = match &start_at {
-                Some(s) => parse_start(s)?,
-                None => Duration::ZERO,
+            // Parse an explicit --start-at up front so a bad value fails before
+            // we download anything.
+            let explicit_start = match &start_at {
+                Some(s) => Some(parse_start(s)?),
+                None => None,
             };
             let archive = Archive::new()?;
             let session = rt.block_on(resolve_session(&archive, year, &query))?;
@@ -90,7 +110,21 @@ fn main() -> Result<()> {
                 },
             ))?;
             if entries.is_empty() {
-                bail!("no data in the archive for this session");
+                bail!(
+                    "no timing data on the archive for {} — {} ({}); \
+                     the session may not have been recorded",
+                    session.meeting, session.session.name, session.session.start_date
+                );
+            }
+            // Default the seek to the green flag so we land on racing, not the
+            // long pre-session grid. An explicit --start-at always wins; the
+            // pre-session stays in the timeline and is reachable by rewinding.
+            let start = match explicit_start {
+                Some(s) => s,
+                None => source::replay::green_flag(&entries).unwrap_or(Duration::ZERO),
+            };
+            if explicit_start.is_none() && !start.is_zero() {
+                println!("Starting at the green flag ({}).", fmt_hms(start));
             }
             println!("{} messages — starting replay", entries.len());
 
@@ -105,45 +139,198 @@ fn main() -> Result<()> {
             ));
             ui::run(rx, tx, Some(ctrl_tx), rt.handle().clone(), speed)
         }
+        Command::Cache { action } => run_cache(action),
     }
 }
 
+fn run_cache(action: CacheAction) -> Result<()> {
+    let archive = Archive::new()?;
+    match action {
+        CacheAction::Path => println!("{}", archive.cache_dir().display()),
+        CacheAction::Info => {
+            let u = archive.cache_usage();
+            println!("Cache: {}", archive.cache_dir().display());
+            println!("  sessions:  {}", fmt_bytes(u.sessions));
+            println!("  schedules: {}", fmt_bytes(u.schedules));
+            println!("  circuits:  {}", fmt_bytes(u.circuits));
+            println!("  total:     {}", fmt_bytes(u.total()));
+        }
+        CacheAction::Clear { year } => {
+            let freed = archive.clear_cache(year)?;
+            match year {
+                Some(y) => println!("Cleared {y} session cache — freed {}", fmt_bytes(freed)),
+                None => println!("Cleared cache — freed {}", fmt_bytes(freed)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A byte count as a human-readable size (B, KB, MB, GB; 1 KB = 1024 B).
+fn fmt_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+/// Today's date in UTC as `YYYY-MM-DD`, for the availability gate.
+fn today() -> String {
+    chrono::Utc::now().date_naive().to_string()
+}
+
+/// Resolve a replay target from the unified Jolpica schedule. With a query:
+/// exactly one *available* session matches → play it directly; otherwise drop
+/// into the browser pre-filtered by the query. Empty query → full browser.
 async fn resolve_session(
     archive: &Archive,
     year: u16,
     query: &[String],
 ) -> Result<source::archive::SessionRef> {
-    let mut matches = archive.find_sessions(year, query).await?;
-    match matches.len() {
-        0 => bail!(
-            "no {year} session matches \"{}\" — try `boxbox sessions --year {year}`",
-            query.join(" ")
-        ),
-        1 => Ok(matches.remove(0)),
-        _ => {
-            eprintln!("Multiple sessions match — be more specific:");
-            for m in &matches {
-                eprintln!(
-                    "  {} — {} ({})",
-                    m.meeting, m.session.name, m.session.start_date
-                );
-            }
-            bail!("{} matches", matches.len());
+    let schedule = archive.schedule(year).await.with_context(|| {
+        format!("couldn't load the {year} schedule (Jolpica); try `boxbox replay --list --year {year}`")
+    })?;
+    if schedule.is_empty() {
+        bail!("no races found for {year} — Jolpica has schedules from 1950 on; check the year");
+    }
+    let today = today();
+
+    if !query.is_empty() {
+        let expanded = source::schedule::expand_query(query);
+        // (race, session) pairs matching every query word, available only.
+        let hits: Vec<_> = schedule
+            .iter()
+            .flat_map(|r| {
+                r.matches(&expanded)
+                    .into_iter()
+                    .filter(|s| s.is_available(&today))
+                    .map(move |s| (r, s))
+            })
+            .collect();
+        if let [(race, scheduled)] = hits.as_slice() {
+            return Ok(session_ref(archive, year, race, scheduled));
+        }
+    }
+
+    browse(archive, year, &schedule, query, &today)
+}
+
+/// Interactive race → session picker over the schedule. `query` pre-filters the
+/// race list (races with at least one matching session), so an ambiguous query
+/// lands in a narrowed browser rather than a dead end.
+fn browse(
+    archive: &Archive,
+    year: u16,
+    schedule: &[source::schedule::ScheduledRace],
+    query: &[String],
+    today: &str,
+) -> Result<source::archive::SessionRef> {
+    let expanded = source::schedule::expand_query(query);
+    let filtered: Vec<_> = schedule
+        .iter()
+        .filter(|r| !query.is_empty() && !r.matches(&expanded).is_empty())
+        .collect();
+    let candidates: Vec<_> = if filtered.is_empty() {
+        if !query.is_empty() {
+            eprintln!(
+                "nothing in {year} matched {} — showing the full schedule.\n\
+                 (tokens match whole words; dash multi-word names, e.g. sao-paulo)",
+                query.join(" ")
+            );
+        }
+        schedule.iter().collect()
+    } else {
+        filtered
+    };
+
+    let race = if candidates.len() == 1 {
+        candidates[0]
+    } else {
+        eprintln!("\n{year} races:");
+        for (i, r) in candidates.iter().enumerate() {
+            eprintln!("  {:>2}) {} ({})", i + 1, r.name, r.race_date);
+        }
+        candidates[prompt_index("Pick a race", candidates.len(), |_| true)?]
+    };
+
+    eprintln!("\n{} sessions:", race.name);
+    for (i, s) in race.sessions.iter().enumerate() {
+        let tag = if s.is_available(today) {
+            String::new()
+        } else {
+            " — not yet available".to_string()
+        };
+        eprintln!("  {:>2}) {} ({}){tag}", i + 1, s.name, s.date);
+    }
+    let sidx = prompt_index("Pick a session", race.sessions.len(), |i| {
+        race.sessions[i].is_available(today)
+    })?;
+    Ok(session_ref(archive, year, race, &race.sessions[sidx]))
+}
+
+fn session_ref(
+    archive: &Archive,
+    year: u16,
+    race: &source::schedule::ScheduledRace,
+    scheduled: &source::schedule::ScheduledSession,
+) -> source::archive::SessionRef {
+    source::archive::SessionRef {
+        meeting: race.name.clone(),
+        session: archive.session_from_schedule(year, race, scheduled),
+    }
+}
+
+/// Prompt on stderr for a 1-based selection, returning a 0-based index.
+/// `available(idx)` gates which rows may be chosen (future sessions can't).
+fn prompt_index(label: &str, len: usize, available: impl Fn(usize) -> bool) -> Result<usize> {
+    use std::io::Write;
+    loop {
+        eprint!("{label} [1-{len}]: ");
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            bail!("no selection (end of input) — pass a race/session query to skip the picker");
+        }
+        match line.trim().parse::<usize>() {
+            Ok(n) if (1..=len).contains(&n) && available(n - 1) => return Ok(n - 1),
+            Ok(n) if (1..=len).contains(&n) => eprintln!("that session isn't available yet"),
+            _ => eprintln!("enter a number between 1 and {len}"),
         }
     }
 }
 
-async fn list_sessions(year: u16) -> Result<()> {
+/// Print the full season schedule from Jolpica, marking unheld sessions.
+async fn print_schedule(year: u16) -> Result<()> {
     let archive = Archive::new()?;
-    let index = archive.year_index(year).await?;
-    for meeting in &index.meetings {
-        println!("{}", meeting.name);
-        for s in &meeting.sessions {
-            let archived = if s.path.is_some() { "" } else { "  (not archived)" };
-            println!("  {} — {}{archived}", s.name, s.start_date);
+    let schedule = archive.schedule(year).await?;
+    let today = today();
+    println!("{year} season schedule:\n");
+    for race in &schedule {
+        println!("{}", race.name);
+        for s in &race.sessions {
+            let tag = if s.is_available(&today) {
+                ""
+            } else {
+                "  (not yet available)"
+            };
+            println!("  {} — {}{tag}", s.name, s.date);
         }
     }
     Ok(())
+}
+
+/// A `Duration` as `H:MM:SS`, for logging the auto-seek point.
+fn fmt_hms(d: Duration) -> String {
+    let s = d.as_secs();
+    format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
 }
 
 fn parse_start(s: &str) -> Result<Duration> {
