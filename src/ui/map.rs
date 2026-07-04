@@ -92,7 +92,14 @@ struct MapCar {
     /// Dim to gray (in pit, or off a hot lap during quali).
     dim: bool,
     selected: bool,
+    /// Holds the session-best lap (emphasized in practice; pulses on a new best).
+    fastest: bool,
+    /// Flash magenta this frame — a new fastest lap was just set.
+    pulse: bool,
 }
+
+/// Magenta used for the fastest-lap accent/pulse, matching the header FL chip.
+const FL_MAGENTA: (u8, u8, u8) = (255, 0, 255);
 
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     let Some(track) = &app.track else { return };
@@ -114,7 +121,11 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     // only the selected driver (avoids a wall of overlapping text).
     let label_all = area.width >= 44 && app.vm.cars.len() <= 24;
     let is_quali = app.vm.is_qualifying();
+    // Practice has no laps and isn't quali: highlight the fastest-lap holder.
+    let is_practice = !app.vm.is_race() && !is_quali;
     let selected_tla = app.selected_tla();
+    let fastest_tla = app.vm.fastest.as_ref().map(|(_, tla)| tla.as_str());
+    let pulsing_tla = app.pulsing_tla();
 
     let cars: Vec<MapCar> = app
         .vm
@@ -122,15 +133,21 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|c| {
             let selected = selected_tla.as_deref() == Some(c.tla.as_str());
+            let fastest = fastest_tla == Some(c.tla.as_str());
+            let pulse = pulsing_tla == Some(c.tla.as_str());
             // In qualifying, spotlight who's actually on a lap; dim the rest.
-            let dim = c.in_pit || (is_quali && !c.hot_lap && !selected);
+            // Never dim the practice fastest-lap holder.
+            let dim = (c.in_pit || (is_quali && !c.hot_lap && !selected))
+                && !(is_practice && fastest);
             MapCar {
                 pos: track.transform((c.x, c.y)),
                 color: c.color,
                 tla: c.tla.clone(),
-                label: label_all || selected,
+                label: label_all || selected || (is_practice && fastest) || pulse,
                 dim,
                 selected,
+                fastest: is_practice && fastest,
+                pulse,
             }
         })
         .collect();
@@ -168,7 +185,13 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
 
             for car in &cars {
                 let (x, y) = car.pos;
-                let (cr, cg, cb) = if car.dim { (90, 90, 90) } else { car.color };
+                let (cr, cg, cb) = if car.pulse || car.fastest {
+                    FL_MAGENTA
+                } else if car.dim {
+                    (90, 90, 90)
+                } else {
+                    car.color
+                };
                 let color = Color::Rgb(cr, cg, cb);
 
                 // A filled blob wider than the track ribbon so cars stand out.
@@ -201,6 +224,8 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
                 let (x, y) = car.pos;
                 let style = if car.selected {
                     Style::default().fg(Color::White).bg(Color::Rgb(car.color.0, car.color.1, car.color.2))
+                } else if car.pulse || car.fastest {
+                    Style::default().fg(Color::Rgb(FL_MAGENTA.0, FL_MAGENTA.1, FL_MAGENTA.2))
                 } else if car.dim {
                     Style::default().fg(Color::DarkGray)
                 } else {

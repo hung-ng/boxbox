@@ -12,7 +12,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::Frame;
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 pub const SPEED_STEPS: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0];
@@ -45,10 +45,19 @@ pub struct App {
     selected_tla: Option<String>,
     pub rc_open: bool,
     pub rc_scroll: usize,
+    /// Keybindings help overlay (toggled with `?`).
+    pub help_open: bool,
     pub track: Option<map::TrackOutline>,
     pub ended: bool,
     circuit_requested: bool,
+    /// TLA holding the session-best lap, and when it was last claimed — drives
+    /// the ~1s magenta pulse on the map when a new overall best appears.
+    last_fastest_tla: Option<String>,
+    fastest_since: Option<Instant>,
 }
+
+/// How long a new fastest-lap pulse flashes on the map.
+const PULSE: Duration = Duration::from_millis(1000);
 
 impl App {
     /// TLA of the driver the map should spotlight: the explicitly-followed one,
@@ -57,6 +66,15 @@ impl App {
         self.selected_tla
             .clone()
             .or_else(|| self.vm.rows.get(self.selected).map(|r| r.tla.clone()))
+    }
+
+    /// TLA to flash magenta this frame, if a new fastest lap is still within the
+    /// pulse window.
+    pub fn pulsing_tla(&self) -> Option<&str> {
+        let since = self.fastest_since?;
+        (since.elapsed() < PULSE)
+            .then_some(self.last_fastest_tla.as_deref())
+            .flatten()
     }
 }
 
@@ -81,9 +99,12 @@ pub fn run(
         selected_tla: None,
         rc_open: false,
         rc_scroll: 0,
+        help_open: false,
         track: None,
         ended: false,
         circuit_requested: false,
+        last_fastest_tla: None,
+        fastest_since: None,
     };
 
     let result = loop {
@@ -110,6 +131,15 @@ pub fn run(
         if app.state.dirty {
             app.state.dirty = false;
             app.vm = view::build(&app.state);
+            // A new session-best lap-holder starts the pulse; ignore the first
+            // appearance so we don't flash on initial data load.
+            let fastest_tla = app.vm.fastest.as_ref().map(|(_, tla)| tla.clone());
+            if fastest_tla != app.last_fastest_tla {
+                if app.last_fastest_tla.is_some() && fastest_tla.is_some() {
+                    app.fastest_since = Some(Instant::now());
+                }
+                app.last_fastest_tla = fastest_tla;
+            }
             // Keep the focus on the same driver as positions shuffle.
             if let Some(tla) = &app.selected_tla {
                 if let Some(i) = app.vm.rows.iter().position(|r| &r.tla == tla) {
@@ -146,7 +176,9 @@ pub fn run(
                 match key.code {
                     KeyCode::Char('q') => break Ok(()),
                     KeyCode::Esc => {
-                        if app.rc_open {
+                        if app.help_open {
+                            app.help_open = false;
+                        } else if app.rc_open {
                             app.rc_open = false;
                         } else {
                             break Ok(());
@@ -158,6 +190,9 @@ pub fn run(
                     KeyCode::Char('r') => {
                         app.rc_open = !app.rc_open;
                         app.rc_scroll = 0;
+                    }
+                    KeyCode::Char('?') => {
+                        app.help_open = !app.help_open;
                     }
                     KeyCode::Up => {
                         if app.rc_open {
@@ -291,11 +326,19 @@ fn draw(f: &mut Frame, app: &mut App) {
             map::draw(f, map_area, app);
             let [tower_area, focus_area] =
                 Layout::vertical([Constraint::Min(6), Constraint::Length(8)]).areas(side_area);
-            tower::draw(f, tower_area, app);
+            // Narrow side pane: use the compact per-sector strip so quali's
+            // live-lap column isn't clipped.
+            tower::draw(f, tower_area, app, true);
             focus::draw(f, focus_area, app);
         }
         ViewMode::MapOnly => map::draw(f, body_area, app),
-        ViewMode::TowerOnly => tower::draw(f, body_area, app),
+        ViewMode::TowerOnly => {
+            // Full-width tower over the driver panel, mirroring Split's right column.
+            let [tower_area, focus_area] =
+                Layout::vertical([Constraint::Min(6), Constraint::Length(8)]).areas(body_area);
+            tower::draw(f, tower_area, app, false);
+            focus::draw(f, focus_area, app);
+        }
     }
 
     racecontrol::ticker(f, ticker_area, app);
@@ -304,6 +347,66 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.rc_open {
         racecontrol::overlay(f, app);
     }
+    if app.help_open {
+        help_overlay(f, app);
+    }
+}
+
+/// Centered keybindings reference (toggled with `?`), reusing the race-control
+/// overlay's Clear + bordered-block pattern.
+fn help_overlay(f: &mut Frame, app: &App) {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+    let mut keys: Vec<(&str, &str)> = vec![
+        ("↑ / ↓", "select driver (focus panel + map spotlight)"),
+        ("m", "cycle view: split → map → tower → auto"),
+        ("r", "race control message log"),
+        ("?", "toggle this help"),
+    ];
+    if app.is_replay {
+        keys.extend([
+            ("space", "pause / resume playback"),
+            ("+ / -", "playback speed"),
+            ("f / F", "jump forward 1 / 5 min"),
+        ]);
+    }
+    keys.push(("q / Esc", "quit"));
+
+    let key_w = keys.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
+    let mut lines: Vec<Line> = vec![Line::from("")];
+    for (k, desc) in &keys {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("{k:<key_w$}"),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(*desc, Style::default().fg(Color::Gray)),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    let screen = f.area();
+    let width = (key_w as u16 + 52).min(screen.width.saturating_sub(4));
+    let height = (lines.len() as u16 + 2).min(screen.height.saturating_sub(2));
+    let area = Rect {
+        x: (screen.width.saturating_sub(width)) / 2,
+        y: (screen.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Keybindings (?/Esc close) "),
+        ),
+        area,
+    );
 }
 
 fn footer(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
@@ -311,9 +414,9 @@ fn footer(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     use ratatui::text::{Line, Span};
 
     let keys = if app.is_replay {
-        "q quit · ↑↓ driver · r messages · space pause · +/- speed · f/F +1/5min · m view"
+        "q quit · ↑↓ driver · r messages · space pause · +/- speed · f/F +1/5min · m view · ? help"
     } else {
-        "q quit · ↑↓ driver · r messages · m view"
+        "q quit · ↑↓ driver · r messages · m view · ? help"
     };
     let mut spans = vec![Span::styled(keys, Style::default().fg(Color::DarkGray))];
     if !app.status.is_empty() {

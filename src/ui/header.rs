@@ -29,6 +29,24 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     ));
 
+    // Session-type accent so race / quali / practice is readable at a glance.
+    let (kind, kind_color) = if vm.is_race() {
+        ("RACE", Color::Rgb(120, 200, 255))
+    } else if vm.is_qualifying() {
+        ("QUALI", Color::Rgb(255, 170, 90))
+    } else if !vm.session_type.is_empty() {
+        ("PRACTICE", Color::Rgb(150, 210, 150))
+    } else {
+        ("", Color::DarkGray)
+    };
+    if !kind.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            kind,
+            Style::default().fg(kind_color).add_modifier(Modifier::BOLD),
+        ));
+    }
+
     // Progress: lap counter (race) or Q-segment + remaining clock.
     spans.push(sep.clone());
     let progress = if let Some((cur, total)) = vm.lap {

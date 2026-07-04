@@ -9,7 +9,9 @@ use ratatui::Frame;
 /// A car within this interval of the one ahead is "in the battle" (≈ DRS range).
 const BATTLE_GAP_SECS: f64 = 1.0;
 
-pub fn draw(f: &mut Frame, area: Rect, app: &App) {
+/// `compact` collapses the quali live-lap strip to one block per sector so it
+/// fits the narrow Split side pane instead of being clipped.
+pub fn draw(f: &mut Frame, area: Rect, app: &App, compact: bool) {
     let is_race = app.vm.is_race();
     let cutoff = app.vm.quali_cutoff();
 
@@ -31,7 +33,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         rows.push(if is_race {
             race_row(r, selected)
         } else {
-            quali_row(r, selected, cutoff)
+            quali_row(r, selected, cutoff, compact)
         });
         // Elimination line after the last safe position in Q1/Q2.
         if cutoff == Some(r.position) {
@@ -97,7 +99,7 @@ fn race_row(r: &VRow, selected: bool) -> Row<'static> {
     .height(1)
 }
 
-fn quali_row(r: &VRow, selected: bool, cutoff: Option<u32>) -> Row<'static> {
+fn quali_row(r: &VRow, selected: bool, cutoff: Option<u32>, compact: bool) -> Row<'static> {
     let dim = r.retired || r.stopped || r.knocked_out;
     let base = base_style(dim);
     let in_drop_zone = cutoff.is_some_and(|c| r.position > c) && !dim;
@@ -122,7 +124,11 @@ fn quali_row(r: &VRow, selected: bool, cutoff: Option<u32>) -> Row<'static> {
         }),
         gap_cell,
         tire_cell(r, dim),
-        Cell::from(segments_line(r)),
+        Cell::from(if compact {
+            compact_segments_line(r)
+        } else {
+            segments_line(r)
+        }),
     ])
     .height(1)
 }
@@ -229,6 +235,33 @@ pub fn segments_line(r: &VRow) -> Line<'static> {
             };
             spans.push(Span::styled(ch, Style::default().fg(color)));
         }
+    }
+    Line::from(spans)
+}
+
+/// One block per sector, colored by the sector's strongest mini-sector status.
+/// Fixed 5 cells wide (`▪|▪|▪`) so it never clips the narrow Split pane.
+pub fn compact_segments_line(r: &VRow) -> Line<'static> {
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, sector) in r.segments.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("|", Style::default().fg(Color::DarkGray)));
+        }
+        // Rank statuses so the block reflects the best segment reached so far.
+        let color = sector
+            .iter()
+            .map(|seg| match seg {
+                Segment::OverallBest => (4, Color::Magenta),
+                Segment::PersonalBest => (3, Color::Green),
+                Segment::Set => (2, Color::Yellow),
+                Segment::Pit => (1, Color::Cyan),
+                Segment::NotSet => (0, Color::DarkGray),
+            })
+            .max_by_key(|(rank, _)| *rank)
+            .map(|(_, c)| c)
+            .unwrap_or(Color::DarkGray);
+        let ch = if color == Color::DarkGray { "·" } else { "▪" };
+        spans.push(Span::styled(ch, Style::default().fg(color)));
     }
     Line::from(spans)
 }
