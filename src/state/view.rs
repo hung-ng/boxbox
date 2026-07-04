@@ -84,7 +84,11 @@ pub struct CarDot {
     pub x: f64,
     pub y: f64,
     pub color: (u8, u8, u8),
+    pub tla: String,
     pub in_pit: bool,
+    /// True when the driver appears to be on a flying/timed lap right now
+    /// (out of the pits, improving). Used to spotlight cars in qualifying.
+    pub hot_lap: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,11 +395,20 @@ fn build_cars(state: &SessionState, rows: &[Row]) -> Vec<CarDot> {
         .filter(|r| !r.retired && !r.stopped)
         .filter_map(|r| {
             let pos = state.positions.get(&r.number)?;
+            let in_pit = !pos.on_track || r.in_pit;
+            // A car is "on a hot lap" when it's out of the pits and either just
+            // exited (out-lap becomes a flyer) or is currently posting sectors.
+            let posting = r.segments.iter().flatten().any(|s| {
+                matches!(s, Segment::PersonalBest | Segment::OverallBest | Segment::Set)
+            });
+            let hot_lap = !in_pit && !r.pit_out && posting;
             Some(CarDot {
                 x: pos.x,
                 y: pos.y,
                 color: r.team_color,
-                in_pit: !pos.on_track,
+                tla: r.tla.clone(),
+                in_pit,
+                hot_lap,
             })
         })
         .collect()

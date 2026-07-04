@@ -1,9 +1,10 @@
 use super::App;
+use crate::state::view::TrackFlag;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::Span as RSpan;
-use ratatui::widgets::canvas::{Canvas, Line as CanvasLine, Points};
+use ratatui::widgets::canvas::{Canvas, Points};
 use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 use serde_json::Value;
@@ -11,8 +12,6 @@ use serde_json::Value;
 pub struct TrackOutline {
     pub points: Vec<(f64, f64)>,
     pub corners: Vec<(f64, f64, i64)>,
-    /// Start/finish line endpoints, perpendicular to the track at outline point 0.
-    pub start_line: Option<((f64, f64), (f64, f64))>,
     bounds: (f64, f64, f64, f64), // min_x, max_x, min_y, max_y
     rotation: f64,                // radians
     center: (f64, f64),
@@ -45,27 +44,11 @@ impl TrackOutline {
         let mut outline = TrackOutline {
             points: Vec::new(),
             corners: Vec::new(),
-            start_line: None,
             bounds: (0.0, 0.0, 0.0, 0.0),
             rotation,
             center,
         };
         outline.points = densify(raw.iter().map(|&p| outline.transform(p)).collect());
-
-        // The outline starts at the start/finish line; draw a tick across the
-        // track there, perpendicular to the racing direction.
-        if raw.len() > 4 {
-            let p0 = outline.transform(raw[0]);
-            let p1 = outline.transform(raw[3]);
-            let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
-            let len = (dx * dx + dy * dy).sqrt();
-            if len > 0.0 {
-                let half = ((max_x - min_x).max(max_y - min_y)) * 0.02;
-                let (nx, ny) = (-dy / len * half, dx / len * half);
-                outline.start_line =
-                    Some(((p0.0 - nx, p0.1 - ny), (p0.0 + nx, p0.1 + ny)));
-            }
-        }
         outline.corners = v
             .get("corners")
             .and_then(|c| c.as_array())
@@ -99,6 +82,18 @@ impl TrackOutline {
     }
 }
 
+/// A car resolved into canvas space, ready to paint.
+struct MapCar {
+    pos: (f64, f64),
+    color: (u8, u8, u8),
+    tla: String,
+    /// Whether this car should carry a text label this frame.
+    label: bool,
+    /// Dim to gray (in pit, or off a hot lap during quali).
+    dim: bool,
+    selected: bool,
+}
+
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     let Some(track) = &app.track else { return };
 
@@ -108,59 +103,140 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     let dots_y = (area.height.max(1) as f64) * 4.0;
     let (x_bounds, y_bounds) = fit_aspect((bx0, bx1), (by0, by1), dots_x, dots_y);
 
-    let cars: Vec<((f64, f64), (u8, u8, u8))> = app
+    // Outline color reflects the current track state — the map doubles as a flag.
+    let outline_color = match app.vm.track_flag {
+        Some(TrackFlag::Yellow | TrackFlag::SafetyCar | TrackFlag::Vsc) => Color::Rgb(120, 100, 30),
+        Some(TrackFlag::Red) => Color::Rgb(120, 40, 40),
+        _ => Color::DarkGray,
+    };
+
+    // Label density: when the pane is roomy, label every car; when it's tight,
+    // only the selected driver (avoids a wall of overlapping text).
+    let label_all = area.width >= 44 && app.vm.cars.len() <= 24;
+    let is_quali = app.vm.is_qualifying();
+    let selected_tla = app.selected_tla();
+
+    let cars: Vec<MapCar> = app
         .vm
         .cars
         .iter()
         .map(|c| {
-            let color = if c.in_pit { (90, 90, 90) } else { c.color };
-            (track.transform((c.x, c.y)), color)
+            let selected = selected_tla.as_deref() == Some(c.tla.as_str());
+            // In qualifying, spotlight who's actually on a lap; dim the rest.
+            let dim = c.in_pit || (is_quali && !c.hot_lap && !selected);
+            MapCar {
+                pos: track.transform((c.x, c.y)),
+                color: c.color,
+                tla: c.tla.clone(),
+                label: label_all || selected,
+                dim,
+                selected,
+            }
         })
         .collect();
 
+    // One braille-dot step in data units, used to thicken lines into ribbons.
+    let rx = (x_bounds.1 - x_bounds.0) / dots_x;
+    let ry = (y_bounds.1 - y_bounds.0) / dots_y;
+
+    // Thicken the outline: each point becomes a small cross so the track reads
+    // as a wider ribbon rather than a hairline.
+    let track_thick = thicken(&track.points, rx, ry);
+
+    // A short mark at the start of the outline (the S/F line), recolored so it
+    // stands out from the thick track ribbon.
+    let sf_len = (track.points.len() / 80).clamp(2, 6);
+    let sf_segment: Vec<(f64, f64)> = track.points.iter().take(sf_len).copied().collect();
+    let sf_thick = thicken(&sf_segment, rx, ry);
+
     let canvas = Canvas::default()
-        .block(Block::default().borders(Borders::TOP).title(" Track "))
+        .block(Block::default().borders(Borders::TOP).title(map_title(app)))
         .marker(Marker::Braille)
         .x_bounds([x_bounds.0, x_bounds.1])
         .y_bounds([y_bounds.0, y_bounds.1])
         .paint(move |ctx| {
             ctx.draw(&Points {
-                coords: &track.points,
-                color: Color::DarkGray,
+                coords: &track_thick,
+                color: outline_color,
             });
-            if let Some(((x1, y1), (x2, y2))) = track.start_line {
-                ctx.draw(&CanvasLine {
-                    x1,
-                    y1,
-                    x2,
-                    y2,
-                    color: Color::White,
-                });
-                ctx.print(
-                    x2,
-                    y2,
-                    RSpan::styled("S/F", Style::default().fg(Color::DarkGray)),
-                );
-            }
+            // Recolor the start/finish stretch on top of the outline.
+            ctx.draw(&Points {
+                coords: &sf_thick,
+                color: Color::White,
+            });
             ctx.layer();
-            for ((x, y), (r, g, b)) in &cars {
-                // A small cluster of points so each car is visible.
-                let rx = (x_bounds.1 - x_bounds.0) / dots_x;
-                let ry = (y_bounds.1 - y_bounds.0) / dots_y;
-                let dot = [
-                    (*x, *y),
-                    (*x + rx, *y),
-                    (*x - rx, *y),
-                    (*x, *y + ry),
-                    (*x, *y - ry),
-                ];
-                ctx.draw(&Points {
-                    coords: &dot,
-                    color: Color::Rgb(*r, *g, *b),
-                });
+
+            for car in &cars {
+                let (x, y) = car.pos;
+                let (cr, cg, cb) = if car.dim { (90, 90, 90) } else { car.color };
+                let color = Color::Rgb(cr, cg, cb);
+
+                // A filled blob wider than the track ribbon so cars stand out.
+                let mut dot = Vec::with_capacity(13);
+                for (mx, my) in [
+                    (0.0, 0.0),
+                    (1.0, 0.0),
+                    (-1.0, 0.0),
+                    (0.0, 1.0),
+                    (0.0, -1.0),
+                    (1.0, 1.0),
+                    (-1.0, 1.0),
+                    (1.0, -1.0),
+                    (-1.0, -1.0),
+                    (2.0, 0.0),
+                    (-2.0, 0.0),
+                    (0.0, 2.0),
+                    (0.0, -2.0),
+                ] {
+                    dot.push((x + rx * mx, y + ry * my));
+                }
+                ctx.draw(&Points { coords: &dot, color });
+            }
+            // Labels on the top layer so they're never occluded by dots.
+            ctx.layer();
+            for car in &cars {
+                if !car.label {
+                    continue;
+                }
+                let (x, y) = car.pos;
+                let style = if car.selected {
+                    Style::default().fg(Color::White).bg(Color::Rgb(car.color.0, car.color.1, car.color.2))
+                } else if car.dim {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Rgb(car.color.0, car.color.1, car.color.2))
+                };
+                ctx.print(x + rx * 2.5, y + ry, RSpan::styled(car.tla.clone(), style));
             }
         });
     f.render_widget(canvas, area);
+}
+
+/// Widen a polyline into a ribbon by adding a one-dot cross around each point.
+fn thicken(points: &[(f64, f64)], rx: f64, ry: f64) -> Vec<(f64, f64)> {
+    let mut out = Vec::with_capacity(points.len() * 5);
+    for &(x, y) in points {
+        out.push((x, y));
+        out.push((x + rx, y));
+        out.push((x - rx, y));
+        out.push((x, y + ry));
+        out.push((x, y - ry));
+    }
+    out
+}
+
+/// Map pane title reflects the session type so it's obvious what you're watching.
+fn map_title(app: &App) -> String {
+    let kind = if app.vm.is_race() {
+        "Race"
+    } else if app.vm.is_qualifying() {
+        "Qualifying"
+    } else if !app.vm.session_type.is_empty() {
+        &app.vm.session_type
+    } else {
+        "Track"
+    };
+    format!(" {kind} · Track ")
 }
 
 /// Expand the smaller range so data units per dot are equal on both axes.

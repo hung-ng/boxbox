@@ -9,13 +9,25 @@ use crate::source::archive::Archive;
 use crate::state::{view, SessionState};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::Frame;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 pub const SPEED_STEPS: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0];
+
+/// Which panes are visible. Chosen automatically from the terminal size each
+/// frame; `m` sets an override that sticks until cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    /// Map (hero, left) beside the timing tower + driver panel (right).
+    Split,
+    /// Track map fills the body.
+    MapOnly,
+    /// Timing tower fills the body.
+    TowerOnly,
+}
 
 pub struct App {
     pub state: SessionState,
@@ -25,7 +37,8 @@ pub struct App {
     pub paused: bool,
     pub sim_clock: Option<Duration>,
     pub status: String,
-    pub show_map: bool,
+    /// User-forced view mode; `None` means auto-pick from the terminal size.
+    pub view_override: Option<ViewMode>,
     /// Index into vm.rows of the driver shown in the focus panel.
     pub selected: usize,
     /// TLA of the selected driver, so selection follows them through position changes.
@@ -35,6 +48,16 @@ pub struct App {
     pub track: Option<map::TrackOutline>,
     pub ended: bool,
     circuit_requested: bool,
+}
+
+impl App {
+    /// TLA of the driver the map should spotlight: the explicitly-followed one,
+    /// else whatever row the cursor currently sits on.
+    pub fn selected_tla(&self) -> Option<String> {
+        self.selected_tla
+            .clone()
+            .or_else(|| self.vm.rows.get(self.selected).map(|r| r.tla.clone()))
+    }
 }
 
 pub fn run(
@@ -53,7 +76,7 @@ pub fn run(
         paused: false,
         sim_clock: None,
         status: String::new(),
-        show_map: true,
+        view_override: None,
         selected: 0,
         selected_tla: None,
         rc_open: false,
@@ -112,6 +135,8 @@ pub fn run(
         }
 
         terminal.draw(|f| draw(f, &mut app))?;
+        // Size used to resolve `m`'s cycle relative to what's currently shown.
+        let size = terminal.size().unwrap_or_default();
 
         if event::poll(Duration::from_millis(33))? {
             if let Event::Key(key) = event::read()? {
@@ -182,7 +207,16 @@ pub fn run(
                             let _ = ctrl.send(PlaybackControl::Jump(Duration::from_secs(300)));
                         }
                     }
-                    KeyCode::Char('m') => app.show_map = !app.show_map,
+                    KeyCode::Char('m') => {
+                        // Cycle Split → MapOnly → TowerOnly → auto, starting from
+                        // whatever is currently on screen.
+                        let cur = app.view_override.unwrap_or(auto_mode(&app, size));
+                        app.view_override = match cur {
+                            ViewMode::Split => Some(ViewMode::MapOnly),
+                            ViewMode::MapOnly => Some(ViewMode::TowerOnly),
+                            ViewMode::TowerOnly => None,
+                        };
+                    }
                     _ => {}
                 }
             }
@@ -206,8 +240,38 @@ fn step_speed(cur: f64, up: bool) -> f64 {
     SPEED_STEPS[next]
 }
 
+/// Pick the best view mode for the given terminal size, honoring the fact that
+/// the map needs a circuit outline to draw anything.
+fn auto_mode(app: &App, size: ratatui::layout::Size) -> ViewMode {
+    let (w, h) = (size.width, size.height);
+    // The body loses 3 rows to header/ticker/footer; a map needs real vertical
+    // room to be worth showing, so short terminals fall back to the tower.
+    if app.track.is_none() || h < 14 {
+        return ViewMode::TowerOnly;
+    }
+    if w >= 100 {
+        ViewMode::Split
+    } else {
+        // Narrow but tall enough: the map is the more glanceable single view.
+        ViewMode::MapOnly
+    }
+}
+
+/// The effective mode after applying the user's override, downgrading if the
+/// override can't actually render (e.g. MapOnly with no track yet).
+fn effective_mode(app: &App, area: Rect) -> ViewMode {
+    let size = ratatui::layout::Size {
+        width: area.width,
+        height: area.height,
+    };
+    match app.view_override {
+        Some(ViewMode::MapOnly | ViewMode::Split) if app.track.is_none() => ViewMode::TowerOnly,
+        Some(m) => m,
+        None => auto_mode(app, size),
+    }
+}
+
 fn draw(f: &mut Frame, app: &mut App) {
-    let show_side = f.area().width >= 100;
     let [status_area, body_area, ticker_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(5),
@@ -218,22 +282,20 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     header::draw(f, status_area, app);
 
-    if show_side {
-        let [tower_area, side_area] =
-            Layout::horizontal([Constraint::Min(48), Constraint::Length(46)]).areas(body_area);
-        tower::draw(f, tower_area, app);
-
-        let map_visible = app.show_map && app.track.is_some();
-        if map_visible {
-            let [map_area, focus_area] =
-                Layout::vertical([Constraint::Min(8), Constraint::Length(8)]).areas(side_area);
+    match effective_mode(app, f.area()) {
+        ViewMode::Split => {
+            // Map is the hero pane on the left; tower + driver panel on the right.
+            let [map_area, side_area] =
+                Layout::horizontal([Constraint::Min(60), Constraint::Length(46)])
+                    .areas(body_area);
             map::draw(f, map_area, app);
+            let [tower_area, focus_area] =
+                Layout::vertical([Constraint::Min(6), Constraint::Length(8)]).areas(side_area);
+            tower::draw(f, tower_area, app);
             focus::draw(f, focus_area, app);
-        } else {
-            focus::draw(f, side_area, app);
         }
-    } else {
-        tower::draw(f, body_area, app);
+        ViewMode::MapOnly => map::draw(f, body_area, app),
+        ViewMode::TowerOnly => tower::draw(f, body_area, app),
     }
 
     racecontrol::ticker(f, ticker_area, app);
@@ -249,9 +311,9 @@ fn footer(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     use ratatui::text::{Line, Span};
 
     let keys = if app.is_replay {
-        "q quit · ↑↓ driver · r messages · space pause · +/- speed · f/F +1/5min · m map"
+        "q quit · ↑↓ driver · r messages · space pause · +/- speed · f/F +1/5min · m view"
     } else {
-        "q quit · ↑↓ driver · r messages · m map"
+        "q quit · ↑↓ driver · r messages · m view"
     };
     let mut spans = vec![Span::styled(keys, Style::default().fg(Color::DarkGray))];
     if !app.status.is_empty() {
