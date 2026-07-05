@@ -58,11 +58,12 @@ pub struct ScheduledRace {
 /// listed here. Each entry rewrites one normalized token to one (possibly
 /// dashed) normalized token, applied after the query is normalized.
 const ALIASES: &[(&str, &str)] = &[
-    ("us", "usa"),      // country is "USA"; multi-race → browser
+    ("us", "usa"),        // country is "USA"; multi-race → browser
     ("cota", "americas"), // United States GP (Austin) nickname
     ("usgp", "americas"),
     ("holland", "dutch"),
     ("quebec", "canadian"),
+    ("britain", "british"), // "British Grand Prix"; `uk` is handled by normalize
 ];
 
 /// Normalize a string to a dash-joined, diacritic-free token stream:
@@ -172,10 +173,7 @@ impl ScheduledRace {
     pub fn session_path(&self, year: u16, s: &ScheduledSession) -> String {
         let meeting = folderize(&self.name);
         let session = folderize(&s.name);
-        format!(
-            "{year}/{}_{meeting}/{}_{session}/",
-            self.race_date, s.date
-        )
+        format!("{year}/{}_{meeting}/{}_{session}/", self.race_date, s.date)
     }
 
     /// A stable synthetic cache key for a reconstructed session (no index Key).
@@ -261,7 +259,10 @@ impl JolpicaRace {
         };
         push("Practice 1", self.first_practice);
         // Sprint weekends: SprintQualifying/Shootout sets the grid for the sprint.
-        push("Sprint Qualifying", self.sprint_qualifying.or(self.sprint_shootout));
+        push(
+            "Sprint Qualifying",
+            self.sprint_qualifying.or(self.sprint_shootout),
+        );
         push("Practice 2", self.second_practice);
         push("Sprint", self.sprint);
         push("Practice 3", self.third_practice);
@@ -343,8 +344,14 @@ mod tests {
             locality: locality.into(),
             country: country.into(),
             sessions: vec![
-                ScheduledSession { name: "Qualifying".into(), date: "2024-07-06".into() },
-                ScheduledSession { name: "Race".into(), date: "2024-07-07".into() },
+                ScheduledSession {
+                    name: "Qualifying".into(),
+                    date: "2024-07-06".into(),
+                },
+                ScheduledSession {
+                    name: "Race".into(),
+                    date: "2024-07-07".into(),
+                },
             ],
         }
     }
@@ -360,12 +367,22 @@ mod tests {
             race("Miami Grand Prix", "miami", "Miami", "USA"),
             race("United States Grand Prix", "americas", "Austin", "USA"),
             race("Las Vegas Grand Prix", "vegas", "Las Vegas", "USA"),
-            race("Austrian Grand Prix", "red_bull_ring", "Spielberg", "Austria"),
-            race("Australian Grand Prix", "albert_park", "Melbourne", "Australia"),
+            race(
+                "Austrian Grand Prix",
+                "red_bull_ring",
+                "Spielberg",
+                "Austria",
+            ),
+            race(
+                "Australian Grand Prix",
+                "albert_park",
+                "Melbourne",
+                "Australia",
+            ),
         ]
     }
 
-    fn hits<'a>(cal: &'a [ScheduledRace], q: &str) -> usize {
+    fn hits(cal: &[ScheduledRace], q: &str) -> usize {
         cal.iter().map(|r| r.matches(&words(q)).len()).sum()
     }
 
@@ -394,7 +411,10 @@ mod tests {
         let cal = usa_calendar();
         // Each USA race contributes its Race session (Qualifying too, but the
         // query has no session token, so both sessions of each match).
-        let usa_races = cal.iter().filter(|r| r.matches(&words("us")).len() == 2).count();
+        let usa_races = cal
+            .iter()
+            .filter(|r| r.matches(&words("us")).len() == 2)
+            .count();
         assert_eq!(usa_races, 3);
     }
 
@@ -425,7 +445,12 @@ mod tests {
         assert_eq!(ad.matches(&words("abu-dhabi")).len(), 2);
         let er = race("Emilia Romagna Grand Prix", "imola", "Imola", "Italy");
         assert_eq!(er.matches(&words("emilia-romagna")).len(), 2);
-        let at = race("Austrian Grand Prix", "red_bull_ring", "Spielberg", "Austria");
+        let at = race(
+            "Austrian Grand Prix",
+            "red_bull_ring",
+            "Spielberg",
+            "Austria",
+        );
         assert_eq!(at.matches(&words("red-bull-ring")).len(), 2);
     }
 
@@ -446,6 +471,10 @@ mod tests {
         assert_eq!(dutch.matches(&words("holland")).len(), 2);
         let canada = race("Canadian Grand Prix", "villeneuve", "Montreal", "Canada");
         assert_eq!(canada.matches(&words("quebec")).len(), 2);
+        let britain = race("British Grand Prix", "silverstone", "Silverstone", "UK");
+        assert_eq!(britain.matches(&words("britain")).len(), 2);
+        // `uk` reaches the same race via the country field, no alias needed.
+        assert_eq!(britain.matches(&words("uk")).len(), 2);
     }
 
     #[test]
@@ -479,7 +508,10 @@ mod tests {
 
     #[test]
     fn availability_by_date() {
-        let s = ScheduledSession { name: "Race".into(), date: "2024-07-07".into() };
+        let s = ScheduledSession {
+            name: "Race".into(),
+            date: "2024-07-07".into(),
+        };
         assert!(s.is_available("2026-07-03"));
         assert!(s.is_available("2024-07-07"));
         assert!(!s.is_available("2024-07-06"));

@@ -1,11 +1,11 @@
 use crate::message::{FeedMessage, SourceEvent};
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::mpsc::Sender;
-use std::time::Duration;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 // F1 moved live timing to SignalR Core (the classic /signalr endpoint 401s).
 const NEGOTIATE_URL: &str =
@@ -27,21 +27,35 @@ const LIVE_TOPICS: &[&str] = &[
     "TimingData",
     "TimingAppData",
     "RaceControlMessages",
+    "PitLaneTimeCollection",
     "Position.z",
 ];
 
 /// Connect to the live feed and pump messages until the receiver hangs up.
 /// Reconnects automatically on drop-outs.
 pub async fn run(tx: Sender<SourceEvent>) {
+    let mut first = true;
     loop {
-        if tx.send(SourceEvent::Info("connecting to live feed…".into())).is_err() {
+        // On every attempt after the first, the next connection delivers a fresh
+        // full snapshot; tell the UI to drop stale state so removed keys don't
+        // linger from the previous session's tree (plan 2.9).
+        if !first && tx.send(SourceEvent::Reset).is_err() {
+            return;
+        }
+        first = false;
+        if tx
+            .send(SourceEvent::Info("connecting to live feed…".into()))
+            .is_err()
+        {
             return;
         }
         match connect_and_stream(&tx).await {
             Ok(()) => return, // receiver gone, clean exit
             Err(e) => {
                 if tx
-                    .send(SourceEvent::Info(format!("feed error: {e:#} — reconnecting in 5s")))
+                    .send(SourceEvent::Info(format!(
+                        "feed error: {e:#} — reconnecting in 5s"
+                    )))
                     .is_err()
                 {
                     return;
@@ -56,7 +70,11 @@ async fn connect_and_stream(tx: &Sender<SourceEvent>) -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("boxbox/", env!("CARGO_PKG_VERSION")))
         .build()?;
-    let resp = client.post(NEGOTIATE_URL).send().await?.error_for_status()?;
+    let resp = client
+        .post(NEGOTIATE_URL)
+        .send()
+        .await?
+        .error_for_status()?;
     let cookies: Vec<String> = resp
         .headers()
         .get_all(reqwest::header::SET_COOKIE)
@@ -70,8 +88,7 @@ async fn connect_and_stream(tx: &Sender<SourceEvent>) -> Result<()> {
         .as_str()
         .context("negotiate response missing connectionToken")?;
 
-    let ws_url =
-        reqwest::Url::parse_with_params(CONNECT_URL, &[("id", token)])?;
+    let ws_url = reqwest::Url::parse_with_params(CONNECT_URL, &[("id", token)])?;
     let mut request = ws_url.as_str().into_client_request()?;
     if !cookies.is_empty() {
         request
@@ -93,25 +110,32 @@ async fn connect_and_stream(tx: &Sender<SourceEvent>) -> Result<()> {
     });
     ws.send(WsMessage::Text(format!("{subscribe}{RECORD_SEP}").into()))
         .await?;
-    if tx.send(SourceEvent::Info("live feed connected".into())).is_err() {
+    if tx
+        .send(SourceEvent::Info("live feed connected".into()))
+        .is_err()
+    {
         return Ok(());
     }
 
     let mut ping_timer = tokio::time::interval(Duration::from_secs(15));
+    let mut last_data = Instant::now();
     loop {
         let frame = tokio::select! {
             frame = ws.next() => frame,
             _ = ping_timer.tick() => {
+                // The 15s ping tick doubles as the watchdog: if no frame has
+                // arrived for 90s, bail so `run` reconnects (plan 2.2).
+                if last_data.elapsed() > Duration::from_secs(90) {
+                    anyhow::bail!("no data for 90s");
+                }
                 ws.send(WsMessage::Text(format!("{}{RECORD_SEP}", json!({"type": 6})).into())).await?;
                 continue;
-            }
-            _ = tokio::time::sleep(Duration::from_secs(90)) => {
-                anyhow::bail!("no data for 90s");
             }
         };
         let Some(frame) = frame else {
             anyhow::bail!("websocket closed");
         };
+        last_data = Instant::now();
         let text = match frame? {
             WsMessage::Text(t) => t.to_string(),
             WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
@@ -139,8 +163,7 @@ fn handle_record(tx: &Sender<SourceEvent>, v: &Value) -> Result<(), ()> {
             let Some(args) = v.get("arguments").and_then(|a| a.as_array()) else {
                 return Ok(());
             };
-            let (Some(topic), Some(data)) =
-                (args.first().and_then(|t| t.as_str()), args.get(1))
+            let (Some(topic), Some(data)) = (args.first().and_then(|t| t.as_str()), args.get(1))
             else {
                 return Ok(());
             };

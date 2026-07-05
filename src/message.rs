@@ -20,6 +20,12 @@ pub enum SourceEvent {
     Clock(Duration),
     /// Circuit outline JSON from the MultiViewer API.
     Circuit(Value),
+    /// Live feed is about to reconnect: drop merged state so removed keys from
+    /// the previous session don't linger into the fresh snapshot.
+    Reset,
+    /// The next upcoming session, for the live empty state: a display string
+    /// like "British Grand Prix — Qualifying (2026-07-04)".
+    NextSession(String),
     Ended,
 }
 
@@ -29,4 +35,7 @@ pub enum PlaybackControl {
     TogglePause,
     /// Jump forward by this much sim time (messages in between apply instantly).
     Jump(Duration),
+    /// Seek backward by this much sim time. The replay resets and fast-applies
+    /// the whole prefix up to the new target (1.3).
+    JumpBack(Duration),
 }

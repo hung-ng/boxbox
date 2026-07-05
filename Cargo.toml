@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "F1 live timing in your terminal — the pit wall timing screen as a TUI"
 license = "MIT"
+repository = "https://github.com/hung-ng/boxbox"
+readme = "README.md"
+keywords = ["f1", "formula1", "tui", "terminal", "live-timing"]
+categories = ["command-line-utilities"]
+rust-version = "1.85"
 
 [dependencies]
 anyhow = "1"

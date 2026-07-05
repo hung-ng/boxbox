@@ -3,7 +3,7 @@ mod source;
 mod state;
 mod ui;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use source::archive::Archive;
 use std::time::Duration;
@@ -26,9 +26,10 @@ enum Command {
         /// Race/session tokens, e.g. "monaco qualifying" or "sao-paulo race".
         /// Dash multi-word names (las-vegas, red-bull-ring); tokens are matched
         /// whole, so a partial word like "silvers" won't hit "silverstone".
+        /// A year goes in `--year`, not here.
         query: Vec<String>,
-        /// Season year, e.g. `--year 2023`. The year is chosen here, never as a
-        /// query token — `replay monaco 2023` looks for a race called "2023".
+        /// Season year, e.g. `--year 2023`. The season is always chosen with
+        /// this flag; a year in the positional query is rejected with a hint.
         #[arg(long, default_value_t = default_year())]
         year: u16,
         /// Playback speed multiplier
@@ -78,9 +79,26 @@ fn main() -> Result<()> {
         Command::Live => {
             let (tx, rx) = std::sync::mpsc::channel();
             rt.spawn(source::live::run(tx.clone()));
-            ui::run(rx, tx, None, rt.handle().clone(), 1.0)
+            // Look up the next upcoming session for the empty-state hint (3.10).
+            let hint_tx = tx.clone();
+            rt.spawn(async move {
+                let year = default_year();
+                // Once the season's over, next_session_line yields None; roll
+                // over to next year (Jolpica publishes it early) so a December
+                // `boxbox live` still shows a hint (6.2).
+                let line = match next_session_line(year).await {
+                    Some(l) => Some(l),
+                    None => next_session_line(year + 1).await,
+                };
+                if let Some(line) = line {
+                    let _ = hint_tx.send(message::SourceEvent::NextSession(line));
+                }
+            });
+            ui::run(rx, tx, None, rt.handle().clone(), 1.0, None)
         }
-        Command::Replay { year, list: true, .. } => rt.block_on(print_schedule(year)),
+        Command::Replay {
+            year, list: true, ..
+        } => rt.block_on(print_schedule(year)),
         Command::Replay {
             query,
             year,
@@ -113,8 +131,24 @@ fn main() -> Result<()> {
                 bail!(
                     "no timing data on the archive for {} — {} ({}); \
                      the session may not have been recorded",
-                    session.meeting, session.session.name, session.session.start_date
+                    session.meeting,
+                    session.session.name,
+                    session.session.start_date
                 );
+            }
+            // Total recording length (last entry's timestamp), for the timeline
+            // and the --start-at bounds check.
+            let total = entries.last().map(|e| e.ts).unwrap_or(Duration::ZERO);
+            // An explicit --start-at past the end would start a replay that
+            // instantly ends — bail helpfully instead (6.3).
+            if let Some(s) = explicit_start {
+                if s >= total {
+                    bail!(
+                        "--start-at {} is past the end of this recording ({})",
+                        fmt_hms(s),
+                        fmt_hms(total)
+                    );
+                }
             }
             // Default the seek to the green flag so we land on racing, not the
             // long pre-session grid. An explicit --start-at always wins; the
@@ -137,7 +171,14 @@ fn main() -> Result<()> {
                 tx.clone(),
                 ctrl_rx,
             ));
-            ui::run(rx, tx, Some(ctrl_tx), rt.handle().clone(), speed)
+            ui::run(
+                rx,
+                tx,
+                Some(ctrl_tx),
+                rt.handle().clone(),
+                speed,
+                Some(total),
+            )
         }
         Command::Cache { action } => run_cache(action),
     }
@@ -187,16 +228,59 @@ fn today() -> String {
     chrono::Utc::now().date_naive().to_string()
 }
 
+/// First session with a date on or after today, as a display line for the live
+/// empty state (3.10). Returns None if the schedule can't be loaded or the
+/// season is over. Date-only granularity is intentional.
+async fn next_session_line(year: u16) -> Option<String> {
+    let archive = Archive::new().ok()?;
+    let schedule = archive.schedule(year).await.ok()?;
+    let today = today();
+    schedule
+        .iter()
+        .flat_map(|r| r.sessions.iter().map(move |s| (r, s)))
+        .filter(|(_, s)| s.date.as_str() >= today.as_str())
+        .min_by(|a, b| a.1.date.cmp(&b.1.date))
+        .map(|(r, s)| format!("{} — {} ({})", r.name, s.name, s.date))
+}
+
 /// Resolve a replay target from the unified Jolpica schedule. With a query:
 /// exactly one *available* session matches → play it directly; otherwise drop
 /// into the browser pre-filtered by the query. Empty query → full browser.
+/// A query token shaped like a year (1900–2099). Seasons are chosen with
+/// `--year`, never as a positional token, so such a token is almost always a
+/// mistake — we fail helpfully rather than searching for a race named "2023".
+fn year_token(t: &str) -> bool {
+    t.len() == 4
+        && (t.starts_with("19") || t.starts_with("20"))
+        && t.chars().all(|c| c.is_ascii_digit())
+}
+
 async fn resolve_session(
     archive: &Archive,
     year: u16,
     query: &[String],
 ) -> Result<source::archive::SessionRef> {
+    // A year in the positional query is a footgun (6.1): point at --year and
+    // echo the user's other tokens so the corrected command is copy-pasteable.
+    if let Some(y) = query.iter().find(|t| year_token(t)) {
+        let rest: Vec<&str> = query
+            .iter()
+            .filter(|t| !year_token(t))
+            .map(String::as_str)
+            .collect();
+        bail!(
+            "a year goes in --year: boxbox replay {} --year {y}",
+            if rest.is_empty() {
+                "<race>".to_string()
+            } else {
+                rest.join(" ")
+            }
+        );
+    }
     let schedule = archive.schedule(year).await.with_context(|| {
-        format!("couldn't load the {year} schedule (Jolpica); try `boxbox replay --list --year {year}`")
+        format!(
+            "couldn't load the {year} schedule (Jolpica); try `boxbox replay --list --year {year}`"
+        )
     })?;
     if schedule.is_empty() {
         bail!("no races found for {year} — Jolpica has schedules from 1950 on; check the year");
@@ -344,4 +428,23 @@ fn parse_start(s: &str) -> Result<Duration> {
         [h, m, s] => Duration::from_secs(h * 3600 + m * 60 + s),
         _ => bail!("bad --start-at, use HH:MM:SS or MM:SS"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::year_token;
+
+    #[test]
+    fn year_token_detects_seasons_only() {
+        assert!(year_token("2023"));
+        assert!(year_token("1999"));
+        assert!(year_token("2026"));
+        // Not years: race names, partial digits, out-of-range centuries.
+        assert!(!year_token("monaco"));
+        assert!(!year_token("race"));
+        assert!(!year_token("202"));
+        assert!(!year_token("20233"));
+        assert!(!year_token("1850"));
+        assert!(!year_token("r12"));
+    }
 }

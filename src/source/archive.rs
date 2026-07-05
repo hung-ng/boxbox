@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
 pub const BASE: &str = "https://livetiming.formula1.com/static";
@@ -15,6 +15,7 @@ pub const TOPICS: &[&str] = &[
     "TimingData",
     "TimingAppData",
     "RaceControlMessages",
+    "PitLaneTimeCollection",
     "Position.z",
 ];
 
@@ -30,12 +31,7 @@ pub struct Session {
 
 impl Session {
     /// Build a session from a schedule-reconstructed archive path.
-    pub fn reconstructed(
-        cache_id: String,
-        name: String,
-        start_date: String,
-        path: String,
-    ) -> Self {
+    pub fn reconstructed(cache_id: String, name: String, start_date: String, path: String) -> Self {
         Session {
             name,
             start_date,
@@ -178,7 +174,14 @@ impl Archive {
             }
         }
         let url = format!("https://api.multiviewer.app/api/v1/circuits/{circuit_key}/{year}");
-        let body = self.client.get(&url).send().await?.error_for_status()?.text().await?;
+        let body = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
         let v: serde_json::Value = serde_json::from_str(strip_bom(&body))?;
         std::fs::create_dir_all(cache_file.parent().unwrap())?;
         std::fs::write(&cache_file, &body)?;

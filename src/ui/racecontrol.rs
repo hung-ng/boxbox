@@ -1,10 +1,10 @@
 use super::App;
 use crate::state::view::RcMessage;
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem};
-use ratatui::Frame;
 
 /// One-line ticker showing the latest non-noise race control message.
 pub fn ticker(f: &mut Frame, area: Rect, app: &App) {

@@ -23,14 +23,29 @@ pub struct SessionState {
     topics: HashMap<String, Value>,
     pub positions: HashMap<String, CarPosition>,
     pub dirty: bool,
+    /// Count of feed messages dropped because they failed to decode/inflate
+    /// (surfaced in the footer so silent corruption is visible — plan 2.10).
+    pub dropped: u32,
 }
 
 impl SessionState {
+    /// Drop all merged topics and positions but keep the running `dropped`
+    /// count. Used on live reconnect so a fresh snapshot starts clean (plan 2.9).
+    pub fn reset(&mut self) {
+        self.topics.clear();
+        self.positions.clear();
+        self.dirty = true;
+    }
+
     pub fn apply(&mut self, msg: FeedMessage) {
         let (topic, data) = if let Some(name) = msg.topic.strip_suffix(".z") {
             match inflate_topic(&msg.data) {
                 Ok(v) => (name.to_string(), v),
-                Err(_) => return,
+                Err(_) => {
+                    self.dropped = self.dropped.saturating_add(1);
+                    self.dirty = true;
+                    return;
+                }
             }
         } else {
             (msg.topic, msg.data)
@@ -82,12 +97,15 @@ impl SessionState {
 }
 
 fn num_f64(v: &Value) -> Option<f64> {
-    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
 /// `.z` topics carry a JSON string of base64-encoded raw-deflate JSON.
 pub fn inflate_topic(data: &Value) -> Result<Value> {
-    let b64 = data.as_str().context("compressed topic payload is not a string")?;
+    let b64 = data
+        .as_str()
+        .context("compressed topic payload is not a string")?;
     let compressed = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .context("invalid base64 in compressed topic")?;

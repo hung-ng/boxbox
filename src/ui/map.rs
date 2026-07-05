@@ -1,17 +1,21 @@
 use super::App;
 use crate::state::view::TrackFlag;
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::Span as RSpan;
 use ratatui::widgets::canvas::{Canvas, Points};
 use ratatui::widgets::{Block, Borders};
-use ratatui::Frame;
 use serde_json::Value;
 
 pub struct TrackOutline {
     pub points: Vec<(f64, f64)>,
     pub corners: Vec<(f64, f64, i64)>,
+    /// Marshal sector `n` mapped to the range of outline-point indices it covers
+    /// (3.1). Sector n runs [its projected index, the next sector's index),
+    /// wrapping for the last. Used to paint active yellow sectors (3.3).
+    pub sector_ranges: Vec<(i64, std::ops::Range<usize>)>,
     bounds: (f64, f64, f64, f64), // min_x, max_x, min_y, max_y
     rotation: f64,                // radians
     center: (f64, f64),
@@ -44,6 +48,7 @@ impl TrackOutline {
         let mut outline = TrackOutline {
             points: Vec::new(),
             corners: Vec::new(),
+            sector_ranges: Vec::new(),
             bounds: (0.0, 0.0, 0.0, 0.0),
             rotation,
             center,
@@ -65,12 +70,67 @@ impl TrackOutline {
             })
             .unwrap_or_default();
 
+        // Marshal sectors (3.1): project each sector's marker to the nearest
+        // outline-point index, then give sector n the span up to sector n+1's
+        // index (wrapping for the last). Same JSON shape as `corners`.
+        let mut sectors: Vec<(i64, usize)> = v
+            .get("marshalSectors")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| {
+                        let n = c.get("number")?.as_i64()?;
+                        let x = c.pointer("/trackPosition/x")?.as_f64()?;
+                        let y = c.pointer("/trackPosition/y")?.as_f64()?;
+                        let t = outline.transform((x, y));
+                        Some((n, outline.nearest_index(t)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Order by position along the outline so consecutive sectors form
+        // contiguous, non-overlapping ranges regardless of source ordering.
+        sectors.sort_by_key(|(_, idx)| *idx);
+        let n_pts = outline.points.len();
+        let mut ranges: Vec<(i64, std::ops::Range<usize>)> = sectors
+            .iter()
+            .enumerate()
+            .map(|(i, &(num, start))| {
+                let end = sectors.get(i + 1).map(|&(_, s)| s).unwrap_or(n_pts);
+                (num, start..end.max(start))
+            })
+            .collect();
+        // The outline is a loop, so the head [0, first sector's start) sits
+        // between the last sector's marker and the first's — it belongs to the
+        // last sector. Give it that extra wrap slice (a sector may hold two).
+        if let (Some(&(_, first_start)), Some((last_num, _))) = (sectors.first(), sectors.last()) {
+            if first_start > 0 {
+                ranges.push((*last_num, 0..first_start));
+            }
+        }
+        outline.sector_ranges = ranges;
+
         let (min_x, max_x) = min_max(outline.points.iter().map(|p| p.0));
         let (min_y, max_y) = min_max(outline.points.iter().map(|p| p.1));
         let pad_x = (max_x - min_x) * 0.05;
         let pad_y = (max_y - min_y) * 0.05;
         outline.bounds = (min_x - pad_x, max_x + pad_x, min_y - pad_y, max_y + pad_y);
         Some(outline)
+    }
+
+    /// Index of the densified outline point nearest a (already transformed)
+    /// position — used to anchor marshal sectors to the drawn outline (3.1).
+    fn nearest_index(&self, (x, y): (f64, f64)) -> usize {
+        self.points
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let da = (a.0 - x).powi(2) + (a.1 - y).powi(2);
+                let db = (b.0 - x).powi(2) + (b.1 - y).powi(2);
+                da.total_cmp(&db)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 
     /// Rotate around the circuit center so the map matches the official orientation.
@@ -112,8 +172,10 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
 
     // Outline color reflects the current track state — the map doubles as a flag.
     let outline_color = match app.vm.track_flag {
-        Some(TrackFlag::Yellow | TrackFlag::SafetyCar | TrackFlag::Vsc) => Color::Rgb(120, 100, 30),
-        Some(TrackFlag::Red) => Color::Rgb(120, 40, 40),
+        Some(TrackFlag::Yellow | TrackFlag::SafetyCar | TrackFlag::Vsc) => {
+            super::color(120, 100, 30)
+        }
+        Some(TrackFlag::Red) => super::color(120, 40, 40),
         _ => Color::DarkGray,
     };
 
@@ -121,8 +183,10 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     // only the selected driver (avoids a wall of overlapping text).
     let label_all = area.width >= 44 && app.vm.cars.len() <= 24;
     let is_quali = app.vm.is_qualifying();
-    // Practice has no laps and isn't quali: highlight the fastest-lap holder.
-    let is_practice = !app.vm.is_race() && !is_quali;
+    // Only spotlight the fastest-lap holder once we know it's actually a
+    // Practice session — `session_type` is empty until SessionInfo arrives, so
+    // the old `!race && !quali` heuristic misfired on connect (plan 2.5).
+    let is_practice = app.vm.is_practice();
     let selected_tla = app.selected_tla();
     let fastest_tla = app.vm.fastest.as_ref().map(|(_, tla)| tla.as_str());
     let pulsing_tla = app.pulsing_tla();
@@ -137,8 +201,8 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
             let pulse = pulsing_tla == Some(c.tla.as_str());
             // In qualifying, spotlight who's actually on a lap; dim the rest.
             // Never dim the practice fastest-lap holder.
-            let dim = (c.in_pit || (is_quali && !c.hot_lap && !selected))
-                && !(is_practice && fastest);
+            let dim =
+                (c.in_pit || (is_quali && !c.hot_lap && !selected)) && !(is_practice && fastest);
             MapCar {
                 pos: track.transform((c.x, c.y)),
                 color: c.color,
@@ -156,9 +220,35 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     let rx = (x_bounds.1 - x_bounds.0) / dots_x;
     let ry = (y_bounds.1 - y_bounds.0) / dots_y;
 
-    // Thicken the outline: each point becomes a small cross so the track reads
-    // as a wider ribbon rather than a hairline.
-    let track_thick = thicken(&track.points, rx, ry);
+    // Split the outline into base points and the points inside an active yellow
+    // marshal sector (3.3), so each slice can be thickened and colored on its
+    // own (thickening the whole outline at once would bleed colors across the
+    // boundary). Under SC/VSC/red, yellow_sectors is empty, so the whole-track
+    // tint in `outline_color` wins by construction.
+    let mut base_pts: Vec<(f64, f64)> = Vec::with_capacity(track.points.len());
+    let mut yellow_pts: Vec<(f64, f64)> = Vec::new();
+    if app.vm.yellow_sectors.is_empty() {
+        base_pts.extend_from_slice(&track.points);
+    } else {
+        for (i, &p) in track.points.iter().enumerate() {
+            let in_yellow = track
+                .sector_ranges
+                .iter()
+                .any(|(n, r)| app.vm.yellow_sectors.contains(n) && r.contains(&i));
+            if in_yellow {
+                yellow_pts.push(p);
+            } else {
+                base_pts.push(p);
+            }
+        }
+    }
+    // Thicken each slice independently so colors don't bleed at the seam.
+    let track_thick = thicken(&base_pts, rx, ry);
+    let yellow_thick = thicken(&yellow_pts, rx, ry);
+
+    // Derived pit-lane trace (3.4): dim, unthickened dots, subordinate to the
+    // ribbon. Transform the raw samples at draw time like car dots.
+    let pit_lane: Vec<(f64, f64)> = app.pit_lane.iter().map(|&p| track.transform(p)).collect();
 
     // A short mark at the start of the outline (the S/F line), recolored so it
     // stands out from the thick track ribbon.
@@ -172,10 +262,24 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         .x_bounds([x_bounds.0, x_bounds.1])
         .y_bounds([y_bounds.0, y_bounds.1])
         .paint(move |ctx| {
+            // Pit lane underneath everything: dim, so it reads as subordinate.
+            if !pit_lane.is_empty() {
+                ctx.draw(&Points {
+                    coords: &pit_lane,
+                    color: Color::DarkGray,
+                });
+            }
             ctx.draw(&Points {
                 coords: &track_thick,
                 color: outline_color,
             });
+            // Active yellow marshal sectors paint over the base outline (3.3).
+            if !yellow_thick.is_empty() {
+                ctx.draw(&Points {
+                    coords: &yellow_thick,
+                    color: Color::Yellow,
+                });
+            }
             // Recolor the start/finish stretch on top of the outline.
             ctx.draw(&Points {
                 coords: &sf_thick,
@@ -192,7 +296,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
                 } else {
                     car.color
                 };
-                let color = Color::Rgb(cr, cg, cb);
+                let color = super::color(cr, cg, cb);
 
                 // A filled blob wider than the track ribbon so cars stand out.
                 let mut dot = Vec::with_capacity(13);
@@ -213,7 +317,10 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
                 ] {
                     dot.push((x + rx * mx, y + ry * my));
                 }
-                ctx.draw(&Points { coords: &dot, color });
+                ctx.draw(&Points {
+                    coords: &dot,
+                    color,
+                });
             }
             // Labels on the top layer so they're never occluded by dots.
             ctx.layer();
@@ -223,13 +330,17 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
                 }
                 let (x, y) = car.pos;
                 let style = if car.selected {
-                    Style::default().fg(Color::White).bg(Color::Rgb(car.color.0, car.color.1, car.color.2))
+                    Style::default().fg(Color::White).bg(super::color(
+                        car.color.0,
+                        car.color.1,
+                        car.color.2,
+                    ))
                 } else if car.pulse || car.fastest {
-                    Style::default().fg(Color::Rgb(FL_MAGENTA.0, FL_MAGENTA.1, FL_MAGENTA.2))
+                    Style::default().fg(super::color(FL_MAGENTA.0, FL_MAGENTA.1, FL_MAGENTA.2))
                 } else if car.dim {
                     Style::default().fg(Color::DarkGray)
                 } else {
-                    Style::default().fg(Color::Rgb(car.color.0, car.color.1, car.color.2))
+                    Style::default().fg(super::color(car.color.0, car.color.1, car.color.2))
                 };
                 ctx.print(x + rx * 2.5, y + ry, RSpan::styled(car.tla.clone(), style));
             }
