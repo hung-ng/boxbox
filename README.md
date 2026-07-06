@@ -4,21 +4,9 @@ F1 live timing in your terminal — the pit wall timing screen as a TUI.
 Positions, gaps, tires, mini-sectors, race control, and a live track map,
 straight from the same feed that powers the official F1 app.
 
-```
- GREEN │ Lap 32/57 │ FL 1:36.167 VER │ A 26.8° · T 31.4° · 1.9m/s · 78% │ ⏵ 3× 0:52:14 / 1:34:20 │ Bahrain GP 2024 · Race
- Timing ──────────────────────────────────────┬ Track ────────────────
-P   DRV  GAP        INT        TIRE   LAST    │        ⣰⠒⠒⢦⡀
-▸ 1 ▍PIA  LAP 32     —         M 17   1:37.556│        ⡇   ⠙⣄    ⢀⡴⠒⢤
-  2 ▍RUS  +7.327    +7.327     M 18   1:38.084│       ⣠⠃    ⠈⠳⢤⡀ ⢐⠗  ⢴
-  3 ▍LEC  +8.454    +1.127     M 14   1:38.048│       ⡇        ⠘⡆ ⢻⣆
-  4 ▍NOR +10.419    +2.062     M 21   1:37.927│      ⠙⠒⠒⠒⠒⠒⠒⠒⠒⠒⠒⠒⠉
-  5 ▍HAM +19.582    +9.032     M 14   1:37.598├ Driver ───────────────
-  6 ▍SAI +38.389   +18.933     M 16   1:39.280│▍ 1 Oscar PIASTRI  #81
-  7 ▍TSU +38.974    +0.585     M 19   1:40.754│LAST 1:37.556 BEST 1:37.1
-  8 ▍ALB +39.561    +0.587     H 14   1:39.164│S1 31.137 S2 42.532 S3 …
- ...                                          │TIRES S 17 → M 17 · 1 stop
- 15:49 L28 FIA STEWARDS: 5 SECOND TIME PENALTY FOR CAR 4 (NOR)   [r] messages
-```
+![boxbox live timing](docs/demo.gif)
+
+_Prefer text? The [layout is broken down below](#the-screen)._
 
 ## Install
 
