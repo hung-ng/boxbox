@@ -247,4 +247,4 @@ control noise is filtered into an overlay.
   256-color `quantize_256` and the CLI `year_token` detector are too, as are
   merge and schedule matching. CI (`.github/workflows/
   ci.yml`) runs `cargo fmt --check` + `clippy -D warnings` + `test` on Linux and
-  macOS, plus a Windows build-only job, pinned to Rust 1.85.
+  macOS, plus a Windows build-only job, pinned to Rust 1.88.

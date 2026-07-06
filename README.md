@@ -28,7 +28,7 @@ cd boxbox
 cargo install --path .
 ```
 
-Requires Rust 1.85 or newer. Needs a terminal ≥100 columns wide for the side panels (the timing tower alone
+Requires Rust 1.88 or newer. Needs a terminal ≥100 columns wide for the side panels (the timing tower alone
 works narrower). Team colors use truecolor when the terminal advertises it
 (`COLORTERM=truecolor`) and fall back to the xterm-256 palette otherwise.
 

@@ -64,7 +64,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         ) && vm.part_label().is_some();
         if ended {
             spans.push(Span::styled(
-                format!("{}ended", seg),
+                format!("{seg}ended"),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
         } else {
