@@ -23,10 +23,12 @@ P   DRV  GAP        INT        TIRE   LAST    │        ⣰⠒⠒⢦⡀
 ## Install
 
 ```sh
+git clone https://github.com/hung-ng/boxbox
+cd boxbox
 cargo install --path .
 ```
 
-Needs a terminal ≥100 columns wide for the side panels (the timing tower alone
+Requires Rust 1.85 or newer. Needs a terminal ≥100 columns wide for the side panels (the timing tower alone
 works narrower). Team colors use truecolor when the terminal advertises it
 (`COLORTERM=truecolor`) and fall back to the xterm-256 palette otherwise.
 
@@ -73,16 +75,15 @@ its size and `boxbox cache clear [--year]` to reclaim space.
 
 | Key | Action |
 | --- | --- |
-| `↑` / `↓` | select a driver (detail panel follows them through the field) |
-| `PgUp` / `PgDn` | move the selection 5 rows (scroll the RC log by 5 when open) |
-| `Home` / `End` | select the leader / last row (oldest / newest in the RC log) |
+| `↑` / `↓` | select a driver (detail panel follows them through the field); scroll the RC log while it's open |
+| `m` | cycle view: split → map → tower → auto |
 | `r` | open/close the full race control log |
 | `space` | pause/resume (replay) |
 | `+` / `-` | playback speed (0.5× – 120×) |
-| `f` / `F` | jump forward 1 / 5 minutes (replay) |
-| `b` / `B` | jump back 1 / 5 minutes (replay) |
-| `←` / `→` | seek back / forward 1 minute (replay) |
-| `m` | cycle view: split → map → tower → auto |
+| `←` / `→` | seek back / forward 1 minute (replay; a paused session scrubs without resuming) |
+| `Shift+←` / `Shift+→` | seek back / forward 5 minutes (`,` / `.` work too, for terminals that don't report Shift on arrows) |
+| `0` | restart from the very beginning (replay) |
+| `g` | restart at the green flag (replay) |
 | `?` | toggle the keybindings help overlay |
 | `q` / `Esc` | quit (Esc closes the overlay first) |
 
@@ -128,4 +129,4 @@ companies. F1 and related marks are trademarks of Formula One Licensing B.V.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

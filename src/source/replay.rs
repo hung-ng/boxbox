@@ -112,42 +112,74 @@ pub async fn play(
     // read past the end of the timeline.
     let total = entries.last().map(|e| e.ts).unwrap_or(Duration::ZERO);
 
-    /// Apply a backward seek: reset, rewind the cursor, fast-apply the prefix.
-    macro_rules! jump_back {
-        ($d:expr) => {{
-            let target = sim_t.saturating_sub($d);
-            // Reset goes down the same channel before the backlog, so the UI can
-            // never interleave old and new state (1.3 ordering guarantee).
-            if tx.send(SourceEvent::Reset).is_err() {
-                return;
+    /// Apply an absolute seek: fold any already-queued controls into the
+    /// target, then reset, rewind the cursor, and fast-apply the prefix.
+    macro_rules! seek_to {
+        ($target:expr) => {{
+            let mut target: Duration = $target;
+            // Key mashing queues seeks faster than prefix replays finish; the
+            // mid-catch-up poll below only folds commands that arrive while a
+            // pass is in flight. Drain what's already waiting here too, so
+            // seeks landing *between* passes also cost one replay, not one each.
+            while let Ok(cmd) = ctrl.try_recv() {
+                match cmd {
+                    PlaybackControl::Jump(d) => target = (target + d).min(total),
+                    PlaybackControl::JumpBack(d) => target = target.saturating_sub(d),
+                    PlaybackControl::SeekTo(t) => target = t.min(total),
+                    PlaybackControl::SetSpeed(s) => speed = s.max(0.1),
+                    PlaybackControl::TogglePause => paused = !paused,
+                }
             }
-            cursor = 0;
-            sim_t = target;
-            skip_until = Some(target);
-            paused = false;
-            ended = false;
-            // Clock emission is gated on `sim_t - last_clock` (saturating): a
-            // high-water mark left over from before the rewind would starve
-            // Clock events until playback re-passed it, freezing the UI
-            // timeline at the seek target while the state plays on underneath.
-            // Rewind it with the cursor.
-            last_clock = target;
+            // Zero-movement seek (e.g. `g` right after launch, which already
+            // starts at the green flag): tearing down and replaying the whole
+            // state for the position we're at would only flash the UI — skip.
+            if target != sim_t || ended {
+                // Reset goes down the same channel before the backlog, so the UI
+                // can never interleave old and new state (1.3 ordering guarantee).
+                if tx.send(SourceEvent::Reset).is_err() {
+                    return;
+                }
+                cursor = 0;
+                sim_t = target;
+                skip_until = Some(target);
+                ended = false;
+                // Clock emission is gated on `sim_t - last_clock` (saturating): a
+                // high-water mark left over from before the rewind would starve
+                // Clock events until playback re-passed it, freezing the UI
+                // timeline at the seek target while the state plays on underneath.
+                // Rewind it with the cursor.
+                last_clock = target;
+            }
         }};
+    }
+
+    /// Apply a backward seek relative to the current sim time.
+    macro_rules! jump_back {
+        ($d:expr) => {
+            seek_to!(sim_t.saturating_sub($d))
+        };
     }
 
     loop {
         // Past the last entry: send Ended once, then idle on control input only
-        // so the session stays rewindable after it finishes (1.2).
+        // so the session stays rewindable after it finishes (1.2). A *paused*
+        // scrub can overrun the end too — hold the final state under ⏸ and only
+        // declare the session ended once playback would actually run past it
+        // (resuming at the end ends it), so the header can't show ⏹ mid-scrub.
         let Some(next_ts) = entries.get(cursor).map(|e| e.ts) else {
-            if !ended {
+            if !ended && !paused {
                 let _ = tx.send(SourceEvent::Ended);
                 ended = true;
             }
             match ctrl.recv().await {
                 Some(PlaybackControl::JumpBack(d)) => jump_back!(d),
+                Some(PlaybackControl::SeekTo(t)) => seek_to!(t),
                 Some(PlaybackControl::SetSpeed(s)) => speed = s.max(0.1),
-                // Pause/forward jump are no-ops at the end; keep idling.
-                Some(_) => {}
+                // Track pause even while ended: the UI toggles its own flag
+                // optimistically, and a rewind must resume in the same state.
+                Some(PlaybackControl::TogglePause) => paused = !paused,
+                // A forward jump is a no-op at the end; keep idling.
+                Some(PlaybackControl::Jump(_)) => {}
                 None => return,
             }
             continue;
@@ -204,6 +236,10 @@ pub async fn play(
                                     until = until.saturating_sub(d);
                                     moved = true;
                                 }
+                                PlaybackControl::SeekTo(t) => {
+                                    until = t.min(total);
+                                    moved = true;
+                                }
                                 PlaybackControl::SetSpeed(s) => speed = s.max(0.1),
                                 PlaybackControl::TogglePause => paused = !paused,
                             }
@@ -255,11 +291,11 @@ pub async fn play(
                 cmd = ctrl.recv() => match cmd {
                     Some(PlaybackControl::SetSpeed(s)) => speed = s.max(0.1),
                     Some(PlaybackControl::TogglePause) => paused = !paused,
-                    Some(PlaybackControl::Jump(d)) => {
-                        skip_until = Some(sim_t + d);
-                        paused = false;
-                    }
+                    // Seeks leave `paused` alone so a paused session can be
+                    // scrubbed: the catch-up pass runs, then we keep waiting.
+                    Some(PlaybackControl::Jump(d)) => skip_until = Some(sim_t + d),
                     Some(PlaybackControl::JumpBack(d)) => jump_back!(d),
+                    Some(PlaybackControl::SeekTo(t)) => seek_to!(t),
                     None => return,
                 },
                 _ = tokio::time::sleep(wait) => {
@@ -392,6 +428,38 @@ mod tests {
     }
 
     #[test]
+    fn seek_preserves_pause() {
+        // Seeking while paused must scrub the state (Reset + backlog + Clock
+        // at the target) and then stay paused: no further playback events.
+        let entries: Vec<ReplayEntry> = (0..300)
+            .map(|i| entry(i, "LapCount", json!({"CurrentLap": i})))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.spawn(play(entries, D::from_secs(200), 100.0, tx, ctrl_rx));
+
+        drain_until_clock(&rx); // initial catch-up, Clock(200)
+        ctrl_tx.send(PlaybackControl::TogglePause).unwrap();
+        ctrl_tx
+            .send(PlaybackControl::JumpBack(D::from_secs(100)))
+            .unwrap();
+        let got = drain_until_clock(&rx);
+        assert!(matches!(got.first(), Some(SourceEvent::Reset)));
+        assert_eq!(
+            got.last()
+                .map(|ev| matches!(ev, SourceEvent::Clock(t) if *t == D::from_secs(100))),
+            Some(true)
+        );
+        // Still paused: at 100x even a moment of playback would emit more
+        // messages, so a quiet channel means the pause survived the seek.
+        assert!(
+            rx.recv_timeout(D::from_millis(300)).is_err(),
+            "events kept flowing after a paused seek"
+        );
+    }
+
+    #[test]
     fn rewind_resumes_clock_events() {
         // Regression for the frozen-timeline bug: after a backward seek, a
         // stale `last_clock` high-water mark starved Clock events until sim
@@ -430,6 +498,103 @@ mod tests {
         assert!(
             next_clock > D::from_secs(50) && next_clock < D::from_secs(120),
             "clock after rewind at {next_clock:?}, expected just past 50s"
+        );
+    }
+
+    #[test]
+    fn absolute_seek_lands_on_target() {
+        // `g`/`0` send SeekTo: from anywhere, Reset, replayed prefix, then
+        // Clock at the target — same shape as a rewind.
+        let entries: Vec<ReplayEntry> = (0..300)
+            .map(|i| entry(i, "LapCount", json!({"CurrentLap": i})))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.spawn(play(entries, D::from_secs(200), 100.0, tx, ctrl_rx));
+
+        drain_until_clock(&rx); // initial catch-up, Clock(200)
+        ctrl_tx
+            .send(PlaybackControl::SeekTo(D::from_secs(60)))
+            .unwrap();
+        let got = drain_until_clock(&rx);
+        assert!(matches!(got.first(), Some(SourceEvent::Reset)));
+        assert_eq!(
+            got.last()
+                .map(|ev| matches!(ev, SourceEvent::Clock(t) if *t == D::from_secs(60))),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn paused_scrub_past_end_does_not_end_until_resumed() {
+        // Scrubbing forward past the last entry while paused must hold the
+        // final state under pause (no Ended → no ⏹ in the header); resuming at
+        // the end is what ends the session.
+        let entries: Vec<ReplayEntry> = (0..300)
+            .map(|i| entry(i, "LapCount", json!({"CurrentLap": i})))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.spawn(play(entries, D::from_secs(200), 100.0, tx, ctrl_rx));
+
+        drain_until_clock(&rx); // initial catch-up, Clock(200)
+        ctrl_tx.send(PlaybackControl::TogglePause).unwrap();
+        ctrl_tx
+            .send(PlaybackControl::Jump(D::from_secs(500))) // clamps to total
+            .unwrap();
+        let got = drain_until_clock(&rx); // scrub backlog + Clock(total)
+        assert_eq!(
+            got.last()
+                .map(|ev| matches!(ev, SourceEvent::Clock(t) if *t == D::from_secs(299))),
+            Some(true)
+        );
+        assert!(
+            rx.recv_timeout(D::from_millis(300)).is_err(),
+            "Ended (or playback) leaked through a paused scrub past the end"
+        );
+        ctrl_tx.send(PlaybackControl::TogglePause).unwrap();
+        assert!(
+            matches!(rx.recv_timeout(D::from_secs(5)), Ok(SourceEvent::Ended)),
+            "resuming at the end must end the session"
+        );
+    }
+
+    #[test]
+    fn pause_toggled_while_ended_survives_a_rewind() {
+        // The ended-idle loop must track TogglePause so the source's pause flag
+        // can't desync from the UI's optimistic one: pause after Ended, rewind,
+        // and expect the scrubbed state to stay paused.
+        let entries: Vec<ReplayEntry> = (0..300)
+            .map(|i| entry(i, "LapCount", json!({"CurrentLap": i})))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // Start on the last entry: the catch-up overruns and Ended follows.
+        rt.spawn(play(entries, D::from_secs(299), 100.0, tx, ctrl_rx));
+
+        drain_until_clock(&rx); // initial catch-up, Clock(299)
+        assert!(matches!(
+            rx.recv_timeout(D::from_secs(5)),
+            Ok(SourceEvent::Ended)
+        ));
+        ctrl_tx.send(PlaybackControl::TogglePause).unwrap();
+        ctrl_tx
+            .send(PlaybackControl::JumpBack(D::from_secs(100)))
+            .unwrap();
+        let got = drain_until_clock(&rx);
+        assert!(matches!(got.first(), Some(SourceEvent::Reset)));
+        assert_eq!(
+            got.last()
+                .map(|ev| matches!(ev, SourceEvent::Clock(t) if *t == D::from_secs(199))),
+            Some(true)
+        );
+        // Still paused: a quiet channel means the ended-idle pause was honored.
+        assert!(
+            rx.recv_timeout(D::from_millis(300)).is_err(),
+            "playback resumed despite pausing in the ended state"
         );
     }
 }

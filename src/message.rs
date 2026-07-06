@@ -38,4 +38,8 @@ pub enum PlaybackControl {
     /// Seek backward by this much sim time. The replay resets and fast-applies
     /// the whole prefix up to the new target (1.3).
     JumpBack(Duration),
+    /// Absolute seek to this sim-time offset (clamped to the recording).
+    /// `0` sends `SeekTo(ZERO)`; `g` sends `SeekTo(green)` with the green-flag
+    /// time `main.rs` hands the UI alongside the timeline total.
+    SeekTo(Duration),
 }

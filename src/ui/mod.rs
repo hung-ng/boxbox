@@ -231,6 +231,8 @@ pub fn run(
     rt: tokio::runtime::Handle,
     initial_speed: f64,
     total: Option<Duration>,
+    // Green-flag sim offset for the `g` restart key (None for live).
+    green: Option<Duration>,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
     let mut app = App {
@@ -314,10 +316,12 @@ pub fn run(
                     // Derived pit-lane trace rebuilds from replayed data (3.4).
                     app.pit_lane.clear();
                 }
+                // Keep draining after Ended: a rewind's Reset may already be
+                // queued right behind it, and breaking here would flash the
+                // ended state for a frame before the Reset clears it.
                 Ok(SourceEvent::Ended) => {
                     app.ended = true;
                     app.status = "end of session data".into();
-                    break;
                 }
                 Err(_) => break,
             }
@@ -508,42 +512,6 @@ pub fn run(
                             app.selected_tla = app.vm.rows.get(app.selected).map(|r| r.tla.clone());
                         }
                     }
-                    // Paging (4.1): ±5 rows in the tower, or ±5 lines in the RC
-                    // overlay (consistent with ↑↓ moving by 1). Home/End jump to
-                    // P1 / last row (oldest / newest in the overlay).
-                    KeyCode::PageUp => {
-                        if app.rc_open {
-                            app.rc_scroll = app.rc_scroll.saturating_add(5);
-                        } else {
-                            app.selected = app.selected.saturating_sub(5);
-                            app.selected_tla = app.vm.rows.get(app.selected).map(|r| r.tla.clone());
-                        }
-                    }
-                    KeyCode::PageDown => {
-                        if app.rc_open {
-                            app.rc_scroll = app.rc_scroll.saturating_sub(5);
-                        } else if !app.vm.rows.is_empty() {
-                            app.selected = (app.selected + 5).min(app.vm.rows.len() - 1);
-                            app.selected_tla = app.vm.rows.get(app.selected).map(|r| r.tla.clone());
-                        }
-                    }
-                    KeyCode::Home => {
-                        if app.rc_open {
-                            // Oldest message: scroll all the way back.
-                            app.rc_scroll = app.vm.race_control.len();
-                        } else {
-                            app.selected = 0;
-                            app.selected_tla = app.vm.rows.first().map(|r| r.tla.clone());
-                        }
-                    }
-                    KeyCode::End => {
-                        if app.rc_open {
-                            app.rc_scroll = 0; // newest
-                        } else if !app.vm.rows.is_empty() {
-                            app.selected = app.vm.rows.len() - 1;
-                            app.selected_tla = app.vm.rows.last().map(|r| r.tla.clone());
-                        }
-                    }
                     KeyCode::Char(' ') => {
                         if let Some(ctrl) = &ctrl {
                             app.paused = !app.paused;
@@ -562,41 +530,37 @@ pub fn run(
                             let _ = ctrl.send(PlaybackControl::SetSpeed(app.speed));
                         }
                     }
-                    KeyCode::Char('f') => {
+                    // ←/→ seek 1 min, Shift+←/→ 5 min. `,`/`.` are modifier-free
+                    // 5-min aliases: not every terminal reports Shift on arrow
+                    // keys (macOS Terminal.app doesn't). Seeks move the timeline
+                    // without touching pause, so a paused session can be
+                    // scrubbed frame by frame.
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(',') | KeyCode::Char('.') => {
                         if let Some(ctrl) = &ctrl {
-                            app.paused = false;
-                            let _ = ctrl.send(PlaybackControl::Jump(Duration::from_secs(60)));
+                            let five = matches!(key.code, KeyCode::Char(_))
+                                || key.modifiers.contains(KeyModifiers::SHIFT);
+                            let d = Duration::from_secs(if five { 300 } else { 60 });
+                            let back = matches!(key.code, KeyCode::Left | KeyCode::Char(','));
+                            let _ = ctrl.send(if back {
+                                PlaybackControl::JumpBack(d)
+                            } else {
+                                PlaybackControl::Jump(d)
+                            });
                         }
                     }
-                    KeyCode::Char('F') => {
+                    // Restart from the very beginning (before the green-flag
+                    // auto-seek point).
+                    KeyCode::Char('0') => {
                         if let Some(ctrl) = &ctrl {
-                            app.paused = false;
-                            let _ = ctrl.send(PlaybackControl::Jump(Duration::from_secs(300)));
+                            let _ = ctrl.send(PlaybackControl::SeekTo(Duration::ZERO));
                         }
                     }
-                    KeyCode::Char('b') => {
+                    // Restart at the green flag, mirroring the --start-at default
+                    // (0:00 for recordings that never report a start).
+                    KeyCode::Char('g') => {
                         if let Some(ctrl) = &ctrl {
-                            app.paused = false;
-                            let _ = ctrl.send(PlaybackControl::JumpBack(Duration::from_secs(60)));
-                        }
-                    }
-                    KeyCode::Char('B') => {
-                        if let Some(ctrl) = &ctrl {
-                            app.paused = false;
-                            let _ = ctrl.send(PlaybackControl::JumpBack(Duration::from_secs(300)));
-                        }
-                    }
-                    // ←/→ are 1-min seek aliases (only ↑↓ are otherwise bound).
-                    KeyCode::Left => {
-                        if let Some(ctrl) = &ctrl {
-                            app.paused = false;
-                            let _ = ctrl.send(PlaybackControl::JumpBack(Duration::from_secs(60)));
-                        }
-                    }
-                    KeyCode::Right => {
-                        if let Some(ctrl) = &ctrl {
-                            app.paused = false;
-                            let _ = ctrl.send(PlaybackControl::Jump(Duration::from_secs(60)));
+                            let _ =
+                                ctrl.send(PlaybackControl::SeekTo(green.unwrap_or(Duration::ZERO)));
                         }
                     }
                     KeyCode::Char('m') => {
@@ -730,22 +694,21 @@ fn help_overlay(f: &mut Frame, app: &App) {
 
     let mut keys: Vec<(&str, &str)> = vec![
         ("↑ / ↓", "select driver (focus panel + map spotlight)"),
-        ("PgUp / PgDn", "move selection 5 rows"),
-        ("Home / End", "select leader / last row"),
         ("m", "cycle view: split → map → tower → auto"),
-        ("r", "race control message log"),
+        ("r", "race control log (↑↓ scrolls while open)"),
         ("?", "toggle this help"),
     ];
     if app.is_replay {
         keys.extend([
             ("space", "pause / resume playback"),
             ("+ / -", "playback speed"),
-            ("f / F", "jump forward 1 / 5 min"),
-            ("b / B", "jump back 1 / 5 min"),
-            ("← / →", "seek back / forward 1 min"),
+            ("← / →", "seek back / forward 1 min (keeps pause)"),
+            ("shift ← / →", "seek back / forward 5 min (also , / .)"),
+            ("0", "restart from the very beginning"),
+            ("g", "restart at the green flag"),
         ]);
     }
-    keys.push(("q / Esc", "quit"));
+    keys.push(("q / Esc", "close overlay, then quit"));
 
     let key_w = keys
         .iter()
@@ -823,7 +786,8 @@ fn footer(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     use ratatui::style::{Color, Style};
     use ratatui::text::{Line, Span};
 
-    // Slimmed to the everyday set (4.3); +/-, f/F/b/B and paging live in `?`.
+    // Slimmed to the everyday set (4.3); +/-, the 5-min seeks (shift-arrows,
+    // `,`/`.`) and the `0`/`g` restarts live in `?`.
     let keys = if app.is_replay {
         "q quit · ↑↓ driver · r messages · space pause · ←/→ seek · m view · ? help"
     } else {

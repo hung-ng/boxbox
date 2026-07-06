@@ -94,7 +94,7 @@ fn main() -> Result<()> {
                     let _ = hint_tx.send(message::SourceEvent::NextSession(line));
                 }
             });
-            ui::run(rx, tx, None, rt.handle().clone(), 1.0, None)
+            ui::run(rx, tx, None, rt.handle().clone(), 1.0, None, None)
         }
         Command::Replay {
             year, list: true, ..
@@ -114,16 +114,27 @@ fn main() -> Result<()> {
             };
             let archive = Archive::new()?;
             let session = rt.block_on(resolve_session(&archive, year, &query))?;
+            let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
             println!(
-                "Loading {} — {} ({})",
-                session.meeting, session.session.name, session.session.start_date
+                "Loading {} — {} {}",
+                session.meeting,
+                session.session.name,
+                tint(tty, "2", &format!("({})", session.session.start_date))
             );
+            // Per-topic download sizes are progress noise: dimmed.
             let entries = rt.block_on(source::replay::load_session(
                 &archive,
                 &session.session,
-                |topic, bytes| {
+                move |topic, bytes| {
                     if bytes > 0 {
-                        println!("  {topic}: {:.1} MB", bytes as f64 / 1e6);
+                        println!(
+                            "{}",
+                            tint(
+                                tty,
+                                "2",
+                                &format!("  {topic}: {:.1} MB", bytes as f64 / 1e6)
+                            )
+                        );
                     }
                 },
             ))?;
@@ -153,10 +164,9 @@ fn main() -> Result<()> {
             // Default the seek to the green flag so we land on racing, not the
             // long pre-session grid. An explicit --start-at always wins; the
             // pre-session stays in the timeline and is reachable by rewinding.
-            let start = match explicit_start {
-                Some(s) => s,
-                None => source::replay::green_flag(&entries).unwrap_or(Duration::ZERO),
-            };
+            // The green offset also feeds the UI's `g` restart key.
+            let green = source::replay::green_flag(&entries).unwrap_or(Duration::ZERO);
+            let start = explicit_start.unwrap_or(green);
             if explicit_start.is_none() && !start.is_zero() {
                 println!("Starting at the green flag ({}).", fmt_hms(start));
             }
@@ -178,6 +188,7 @@ fn main() -> Result<()> {
                 rt.handle().clone(),
                 speed,
                 Some(total),
+                Some(green),
             )
         }
         Command::Cache { action } => run_cache(action),
@@ -317,6 +328,7 @@ fn browse(
     query: &[String],
     today: &str,
 ) -> Result<source::archive::SessionRef> {
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
     let expanded = source::schedule::expand_query(query);
     let filtered: Vec<_> = schedule
         .iter()
@@ -325,9 +337,13 @@ fn browse(
     let candidates: Vec<_> = if filtered.is_empty() {
         if !query.is_empty() {
             eprintln!(
-                "nothing in {year} matched {} — showing the full schedule.\n\
-                 (tokens match whole words; dash multi-word names, e.g. sao-paulo)",
-                query.join(" ")
+                "nothing in {year} matched {} — showing the full schedule.\n{}",
+                query.join(" "),
+                tint(
+                    tty,
+                    "2",
+                    "(tokens match whole words; dash multi-word names, e.g. sao-paulo)"
+                )
             );
         }
         schedule.iter().collect()
@@ -338,21 +354,25 @@ fn browse(
     let race = if candidates.len() == 1 {
         candidates[0]
     } else {
-        eprintln!("\n{year} races:");
+        eprintln!("\n{}", tint(tty, "1", &format!("{year} races:")));
         for (i, r) in candidates.iter().enumerate() {
-            eprintln!("  {:>2}) {} ({})", i + 1, r.name, r.race_date);
+            eprintln!(
+                "  {:>2}) {} {}",
+                i + 1,
+                r.name,
+                tint(tty, "2", &format!("({})", r.race_date))
+            );
         }
         candidates[prompt_index("Pick a race", candidates.len(), |_| true)?]
     };
 
-    eprintln!("\n{} sessions:", race.name);
+    eprintln!("\n{}", tint(tty, "1", &format!("{} sessions:", race.name)));
     for (i, s) in race.sessions.iter().enumerate() {
-        let tag = if s.is_available(today) {
-            String::new()
-        } else {
-            " — not yet available".to_string()
-        };
-        eprintln!("  {:>2}) {} ({}){tag}", i + 1, s.name, s.date);
+        let base = format!("  {:>2}) {}", i + 1, s.name);
+        eprintln!(
+            "{}",
+            session_line(tty, &base, &format!("({})", s.date), s.is_available(today))
+        );
     }
     let sidx = prompt_index("Pick a session", race.sessions.len(), |i| {
         race.sessions[i].is_available(today)
@@ -396,19 +416,43 @@ async fn print_schedule(year: u16) -> Result<()> {
     let archive = Archive::new()?;
     let schedule = archive.schedule(year).await?;
     let today = today();
-    println!("{year} season schedule:\n");
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    println!("{}", tint(tty, "1", &format!("{year} season schedule")));
     for race in &schedule {
-        println!("{}", race.name);
+        println!("\n{}", tint(tty, "1", &race.name));
         for s in &race.sessions {
-            let tag = if s.is_available(&today) {
-                ""
-            } else {
-                "  (not yet available)"
-            };
-            println!("  {} — {}{tag}", s.name, s.date);
+            // Session names top out at "Sprint Qualifying" (17 chars); pad so
+            // the dates line up in a column.
+            let base = format!("  {:<18}", s.name);
+            println!(
+                "{}",
+                session_line(tty, &base, &s.date, s.is_available(&today))
+            );
         }
     }
     Ok(())
+}
+
+/// One picker/schedule session line, shared so the list and the picker can't
+/// drift: available sessions dim only the date; unavailable (future) ones are
+/// dimmed whole with a suffix, matching the browser's rule that they can't be
+/// picked.
+fn session_line(tty: bool, base: &str, date: &str, available: bool) -> String {
+    if available {
+        format!("{base} {}", tint(tty, "2", date))
+    } else {
+        tint(tty, "2", &format!("{base} {date} — not yet available"))
+    }
+}
+
+/// Wrap `s` in an ANSI SGR style (`code`: "1" bold, "2" dim) when the output
+/// stream is a terminal; plain text when piped or redirected.
+fn tint(tty: bool, code: &str, s: &str) -> String {
+    if tty {
+        format!("\x1b[{code}m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
 }
 
 /// A `Duration` as `H:MM:SS`, for logging the auto-seek point.
