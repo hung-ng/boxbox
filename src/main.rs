@@ -33,7 +33,7 @@ enum Command {
         #[arg(long, default_value_t = default_year())]
         year: u16,
         /// Playback speed multiplier
-        #[arg(long, default_value_t = 1.0)]
+        #[arg(long, default_value_t = 1.0, value_parser = parse_speed)]
         speed: f64,
         /// Start offset into the recording (HH:MM:SS or MM:SS). Default: the
         /// green flag, skipping the pre-session; pass 0:00 for the full grid.
@@ -77,7 +77,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Live => {
-            let (tx, rx) = std::sync::mpsc::channel();
+            let (tx, rx) = tokio::sync::mpsc::channel(message::EVENT_CHANNEL_CAPACITY);
             rt.spawn(source::live::run(tx.clone()));
             // Look up the next upcoming session for the empty-state hint (3.10).
             let hint_tx = tx.clone();
@@ -91,7 +91,7 @@ fn main() -> Result<()> {
                     None => next_session_line(year + 1).await,
                 };
                 if let Some(line) = line {
-                    let _ = hint_tx.send(message::SourceEvent::NextSession(line));
+                    let _ = hint_tx.send(message::SourceEvent::NextSession(line)).await;
                 }
             });
             ui::run(rx, tx, None, rt.handle().clone(), 1.0, None, None)
@@ -125,7 +125,7 @@ fn main() -> Result<()> {
             let entries = rt.block_on(source::replay::load_session(
                 &archive,
                 &session.session,
-                move |topic, bytes| {
+                move |topic, bytes, malformed| {
                     if bytes > 0 {
                         println!(
                             "{}",
@@ -135,6 +135,9 @@ fn main() -> Result<()> {
                                 &format!("  {topic}: {:.1} MB", bytes as f64 / 1e6)
                             )
                         );
+                    }
+                    if malformed > 0 {
+                        eprintln!("  {topic}: skipped {malformed} malformed records");
                     }
                 },
             ))?;
@@ -152,14 +155,14 @@ fn main() -> Result<()> {
             let total = entries.last().map(|e| e.ts).unwrap_or(Duration::ZERO);
             // An explicit --start-at past the end would start a replay that
             // instantly ends — bail helpfully instead (6.3).
-            if let Some(s) = explicit_start {
-                if s >= total {
-                    bail!(
-                        "--start-at {} is past the end of this recording ({})",
-                        fmt_hms(s),
-                        fmt_hms(total)
-                    );
-                }
+            if let Some(s) = explicit_start
+                && s >= total
+            {
+                bail!(
+                    "--start-at {} is past the end of this recording ({})",
+                    fmt_hms(s),
+                    fmt_hms(total)
+                );
             }
             // Default the seek to the green flag so we land on racing, not the
             // long pre-session grid. An explicit --start-at always wins; the
@@ -172,8 +175,8 @@ fn main() -> Result<()> {
             }
             println!("{} messages — starting replay", entries.len());
 
-            let (tx, rx) = std::sync::mpsc::channel();
-            let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, rx) = tokio::sync::mpsc::channel(message::EVENT_CHANNEL_CAPACITY);
+            let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel(message::CONTROL_CHANNEL_CAPACITY);
             rt.spawn(source::replay::play(
                 entries,
                 start,
@@ -461,22 +464,57 @@ fn fmt_hms(d: Duration) -> String {
     format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
 }
 
+fn parse_speed(s: &str) -> std::result::Result<f64, String> {
+    let speed = s
+        .parse::<f64>()
+        .map_err(|_| "speed must be a number from 0.5 to 120".to_string())?;
+    if speed.is_finite() && (0.5..=120.0).contains(&speed) {
+        Ok(speed)
+    } else {
+        Err("speed must be a finite number from 0.5 to 120".to_string())
+    }
+}
+
 fn parse_start(s: &str) -> Result<Duration> {
     let nums: Vec<u64> = s
         .split(':')
         .map(|p| p.parse::<u64>())
         .collect::<Result<_, _>>()
         .map_err(|_| anyhow::anyhow!("bad --start-at, use HH:MM:SS or MM:SS"))?;
-    Ok(match nums.as_slice() {
-        [m, s] => Duration::from_secs(m * 60 + s),
-        [h, m, s] => Duration::from_secs(h * 3600 + m * 60 + s),
-        _ => bail!("bad --start-at, use HH:MM:SS or MM:SS"),
-    })
+    let seconds = match nums.as_slice() {
+        [m, s] if *s < 60 => m.checked_mul(60).and_then(|v| v.checked_add(*s)),
+        [h, m, s] if *m < 60 && *s < 60 => h
+            .checked_mul(3600)
+            .and_then(|v| m.checked_mul(60).and_then(|m| v.checked_add(m)))
+            .and_then(|v| v.checked_add(*s)),
+        _ => None,
+    }
+    .ok_or_else(|| anyhow::anyhow!("bad --start-at, use HH:MM:SS or MM:SS"))?;
+    Ok(Duration::from_secs(seconds))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::year_token;
+    use super::{parse_speed, parse_start, year_token};
+    use std::time::Duration;
+
+    #[test]
+    fn replay_speed_rejects_non_finite_and_out_of_range() {
+        for bad in ["NaN", "inf", "-1", "0", "0.49", "120.1"] {
+            assert!(parse_speed(bad).is_err(), "accepted {bad}");
+        }
+        assert_eq!(parse_speed("0.5").unwrap(), 0.5);
+        assert_eq!(parse_speed("120").unwrap(), 120.0);
+    }
+
+    #[test]
+    fn start_offset_rejects_overflow_and_invalid_clock_fields() {
+        assert!(parse_start("18446744073709551615:00").is_err());
+        assert!(parse_start("1:60").is_err());
+        assert!(parse_start("1:60:00").is_err());
+        assert!(parse_start("1:00:60").is_err());
+        assert_eq!(parse_start("90:00").unwrap(), Duration::from_secs(5400));
+    }
 
     #[test]
     fn year_token_detects_seasons_only() {

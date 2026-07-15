@@ -31,6 +31,8 @@ boxbox replay                      # no args: browse year → race → session
 boxbox replay --list --year 2024   # print the season schedule
 ```
 
+`--speed` accepts a finite multiplier from 0.5 to 120.
+
 A query resolves against the full season schedule: a unique match (e.g.
 `monaco qualifying`, `silverstone race`) plays immediately, anything ambiguous
 drops into the browser pre-filtered by what you typed. Matching covers race

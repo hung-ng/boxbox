@@ -102,10 +102,10 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
         ));
         // Last pit-lane time when the feed has reported one (5.2). Duration is
         // pit-lane time (~22s), not the stationary stop — label it as such.
-        if let Some(t) = &r.pit_time {
-            if !t.is_empty() {
-                stint_spans.push(Span::styled(format!("  · pit lane {t}s"), label));
-            }
+        if let Some(t) = &r.pit_time
+            && !t.is_empty()
+        {
+            stint_spans.push(Span::styled(format!("  · pit lane {t}s"), label));
         }
     } else if app.vm.is_practice() {
         // Practice: lap count matters more than stops (3.8).

@@ -9,6 +9,9 @@ use ratatui::widgets::canvas::{Canvas, Points};
 use ratatui::widgets::{Block, Borders};
 use serde_json::Value;
 
+const MAX_INPUT_POINTS: usize = 100_000;
+const MAX_DENSIFIED_POINTS: usize = 200_000;
+
 pub struct TrackOutline {
     pub points: Vec<(f64, f64)>,
     pub corners: Vec<(f64, f64, i64)>,
@@ -27,22 +30,31 @@ impl TrackOutline {
     pub fn parse(v: &Value) -> Option<Self> {
         let xs = v.get("x")?.as_array()?;
         let ys = v.get("y")?.as_array()?;
-        if xs.len() < 2 || xs.len() != ys.len() {
+        if xs.len() < 2 || xs.len() != ys.len() || xs.len() > MAX_INPUT_POINTS {
             return None;
         }
         let raw: Vec<(f64, f64)> = xs
             .iter()
             .zip(ys)
-            .filter_map(|(x, y)| Some((x.as_f64()?, y.as_f64()?)))
-            .collect();
+            .map(|(x, y)| {
+                let pair = (x.as_f64()?, y.as_f64()?);
+                (pair.0.is_finite() && pair.1.is_finite()).then_some(pair)
+            })
+            .collect::<Option<_>>()?;
 
-        let rotation = v
-            .get("rotation")
-            .and_then(|r| r.as_f64())
-            .unwrap_or(0.0)
-            .to_radians();
+        let rotation = match v.get("rotation") {
+            Some(rotation) => rotation.as_f64()?,
+            None => 0.0,
+        };
+        if !rotation.is_finite() {
+            return None;
+        }
+        let rotation = rotation.to_radians();
         let (min_x, max_x) = min_max(raw.iter().map(|p| p.0));
         let (min_y, max_y) = min_max(raw.iter().map(|p| p.1));
+        if min_x >= max_x || min_y >= max_y {
+            return None;
+        }
         let center = ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0);
 
         let mut outline = TrackOutline {
@@ -53,41 +65,16 @@ impl TrackOutline {
             rotation,
             center,
         };
-        outline.points = densify(raw.iter().map(|&p| outline.transform(p)).collect());
-        outline.corners = v
-            .get("corners")
-            .and_then(|c| c.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|c| {
-                        let n = c.get("number")?.as_i64()?;
-                        let x = c.pointer("/trackPosition/x")?.as_f64()?;
-                        let y = c.pointer("/trackPosition/y")?.as_f64()?;
-                        let (tx, ty) = outline.transform((x, y));
-                        Some((tx, ty, n))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        outline.points = densify(raw.iter().map(|&p| outline.transform(p)).collect())?;
+        outline.corners = parse_markers(v, "corners", &outline)?;
 
         // Marshal sectors (3.1): project each sector's marker to the nearest
         // outline-point index, then give sector n the span up to sector n+1's
         // index (wrapping for the last). Same JSON shape as `corners`.
-        let mut sectors: Vec<(i64, usize)> = v
-            .get("marshalSectors")
-            .and_then(|c| c.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|c| {
-                        let n = c.get("number")?.as_i64()?;
-                        let x = c.pointer("/trackPosition/x")?.as_f64()?;
-                        let y = c.pointer("/trackPosition/y")?.as_f64()?;
-                        let t = outline.transform((x, y));
-                        Some((n, outline.nearest_index(t)))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut sectors: Vec<(i64, usize)> = parse_markers(v, "marshalSectors", &outline)?
+            .into_iter()
+            .map(|(x, y, number)| (number, outline.nearest_index((x, y))))
+            .collect();
         // Order by position along the outline so consecutive sectors form
         // contiguous, non-overlapping ranges regardless of source ordering.
         sectors.sort_by_key(|(_, idx)| *idx);
@@ -103,10 +90,10 @@ impl TrackOutline {
         // The outline is a loop, so the head [0, first sector's start) sits
         // between the last sector's marker and the first's — it belongs to the
         // last sector. Give it that extra wrap slice (a sector may hold two).
-        if let (Some(&(_, first_start)), Some((last_num, _))) = (sectors.first(), sectors.last()) {
-            if first_start > 0 {
-                ranges.push((*last_num, 0..first_start));
-            }
+        if let (Some(&(_, first_start)), Some((last_num, _))) = (sectors.first(), sectors.last())
+            && first_start > 0
+        {
+            ranges.push((*last_num, 0..first_start));
         }
         outline.sector_ranges = ranges;
 
@@ -140,6 +127,26 @@ impl TrackOutline {
         let (sin, cos) = self.rotation.sin_cos();
         (dx * cos - dy * sin, dx * sin + dy * cos)
     }
+}
+
+fn parse_markers(value: &Value, key: &str, outline: &TrackOutline) -> Option<Vec<(f64, f64, i64)>> {
+    let Some(markers) = value.get(key) else {
+        return Some(Vec::new());
+    };
+    markers
+        .as_array()?
+        .iter()
+        .map(|marker| {
+            let number = marker.get("number")?.as_i64()?;
+            let x = marker.pointer("/trackPosition/x")?.as_f64()?;
+            let y = marker.pointer("/trackPosition/y")?.as_f64()?;
+            if !x.is_finite() || !y.is_finite() {
+                return None;
+            }
+            let (x, y) = outline.transform((x, y));
+            (x.is_finite() && y.is_finite()).then_some((x, y, number))
+        })
+        .collect()
 }
 
 /// A car resolved into canvas space, ready to paint.
@@ -396,28 +403,85 @@ fn fit_aspect(
 }
 
 /// Insert interpolated points between outline vertices so the drawn line is continuous.
-fn densify(points: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+fn densify(points: Vec<(f64, f64)>) -> Option<Vec<(f64, f64)>> {
     if points.len() < 2 {
-        return points;
+        return Some(points);
     }
     let (min_x, max_x) = min_max(points.iter().map(|p| p.0));
-    let step = ((max_x - min_x) / 400.0).max(1.0);
-    let mut out = Vec::with_capacity(points.len() * 4);
+    let (min_y, max_y) = min_max(points.iter().map(|p| p.1));
+    let step = ((max_x - min_x).max(max_y - min_y) / 400.0).max(1.0);
+    let mut out = Vec::with_capacity(points.len().saturating_mul(4).min(MAX_DENSIFIED_POINTS));
     for w in points.windows(2) {
         let (x0, y0) = w[0];
         let (x1, y1) = w[1];
-        out.push((x0, y0));
         let dist = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
-        let n = (dist / step) as usize;
+        if !dist.is_finite() {
+            return None;
+        }
+        let n = (dist / step).ceil().max(1.0) as usize;
+        if out.len().checked_add(n)?.checked_add(1)? > MAX_DENSIFIED_POINTS {
+            return None;
+        }
+        out.push((x0, y0));
         for i in 1..n {
             let t = i as f64 / n as f64;
             out.push((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t));
         }
     }
     out.push(*points.last().unwrap());
-    out
+    Some(out)
 }
 
 fn min_max(iter: impl Iterator<Item = f64>) -> (f64, f64) {
     iter.fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn malformed_coordinate_does_not_leave_a_partial_outline() {
+        assert!(TrackOutline::parse(&json!({"x": [0.0, "bad"], "y": [0.0, 1.0]})).is_none());
+    }
+
+    #[test]
+    fn degenerate_outline_is_rejected() {
+        assert!(TrackOutline::parse(&json!({"x": [1.0, 1.0], "y": [0.0, 2.0]})).is_none());
+    }
+
+    #[test]
+    fn malformed_rotation_and_markers_are_rejected() {
+        assert!(
+            TrackOutline::parse(&json!({
+                "x": [0.0, 1.0, 2.0],
+                "y": [0.0, 1.0, 0.0],
+                "rotation": "NaN"
+            }))
+            .is_none()
+        );
+        assert!(
+            TrackOutline::parse(&json!({
+                "x": [0.0, 1.0, 2.0],
+                "y": [0.0, 1.0, 0.0],
+                "corners": [{"number": 1, "trackPosition": {"x": "bad", "y": 1.0}}]
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn excessive_densification_is_rejected() {
+        let points = (0..502)
+            .map(|i| {
+                if i % 2 == 0 {
+                    (0.0, 0.0)
+                } else {
+                    (1_000_000_000.0, 1.0)
+                }
+            })
+            .collect();
+        assert!(densify(points).is_none());
+    }
 }

@@ -1,16 +1,49 @@
 use serde_json::Value;
 
+const MAX_ARRAY_INDEX: usize = 65_535;
+
 /// Merge a delta patch into the current state, following the F1 live timing
 /// conventions: objects merge recursively, and arrays are patched by objects
 /// whose keys are numeric indices (`{"3": {...}}` updates/appends element 3).
 /// Anything else replaces the target wholesale.
-pub fn merge(target: &mut Value, patch: Value) {
+pub fn merge(target: &mut Value, patch: Value) -> bool {
+    if !patch_indices_valid(target, &patch) {
+        return false;
+    }
+    merge_validated(target, patch);
+    true
+}
+
+fn patch_indices_valid(target: &Value, patch: &Value) -> bool {
+    let Value::Object(patch_map) = patch else {
+        return true;
+    };
+    match target {
+        Value::Object(target_map) => patch_map.iter().all(|(key, value)| {
+            target_map
+                .get(key)
+                .is_none_or(|slot| patch_indices_valid(slot, value))
+        }),
+        Value::Array(array) => patch_map
+            .iter()
+            .all(|(key, value)| match key.parse::<usize>() {
+                Ok(index) if index > MAX_ARRAY_INDEX => false,
+                Ok(index) => array
+                    .get(index)
+                    .is_none_or(|slot| patch_indices_valid(slot, value)),
+                Err(_) => true,
+            }),
+        _ => true,
+    }
+}
+
+fn merge_validated(target: &mut Value, patch: Value) {
     match patch {
         Value::Object(patch_map) => match target {
             Value::Object(target_map) => {
                 for (k, v) in patch_map {
                     match target_map.get_mut(&k) {
-                        Some(slot) => merge(slot, v),
+                        Some(slot) => merge_validated(slot, v),
                         None => {
                             target_map.insert(k, v);
                         }
@@ -21,7 +54,7 @@ pub fn merge(target: &mut Value, patch: Value) {
                 for (k, v) in patch_map {
                     if let Ok(idx) = k.parse::<usize>() {
                         if idx < arr.len() {
-                            merge(&mut arr[idx], v);
+                            merge_validated(&mut arr[idx], v);
                         } else {
                             while arr.len() < idx {
                                 arr.push(Value::Null);
@@ -71,5 +104,12 @@ mod tests {
         merge(&mut state, json!({"3": {"a": 4}}));
         assert_eq!(state.as_array().unwrap().len(), 4);
         assert_eq!(state[3]["a"], 4);
+    }
+
+    #[test]
+    fn oversized_array_index_is_rejected_without_allocation() {
+        let mut state = json!([{"a": 1}]);
+        assert!(!merge(&mut state, json!({"65536": {"a": 2}})));
+        assert_eq!(state, json!([{"a": 1}]));
     }
 }

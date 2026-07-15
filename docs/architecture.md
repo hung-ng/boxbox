@@ -5,13 +5,25 @@
 ```
 live source (SignalR Core WS) ─┐
                                ├─→ SourceEvent channel → SessionState (delta merge) → ViewModel → ratatui UI
-replay source (archive files) ─┘        (std::sync::mpsc)
+replay source (archive files) ─┘        (Tokio MPSC, capacity 4,096)
 ```
 
 Two data sources produce the same `FeedMessage { topic, data: serde_json::Value, ts }`
 stream; everything downstream is source-agnostic. Network/playback runs on a tokio
 runtime; the UI runs a synchronous crossterm/ratatui loop on the main thread,
-draining the channel each frame (~30 fps).
+draining the bounded channel with `try_recv` each frame (~30 fps). Replay controls
+travel in the opposite direction through a separate Tokio MPSC channel with
+capacity 64.
+
+## Data and storage model
+
+There is no database or persistent application schema. Runtime state is a set of
+per-topic `serde_json::Value` trees in `SessionState`, plus typed derived view
+models. Persistence is a filesystem cache under the platform cache directory:
+`sessions/<cache_id>/<topic>.jsonStream`, `schedules/<year>.json`, and
+`circuits/<key>-<year>.json`. Cache files are validated before use and published
+with a unique sibling temporary file plus atomic rename, so an interrupted write
+is never treated as complete.
 
 ## Modules
 
@@ -25,8 +37,10 @@ draining the channel each frame (~30 fps).
     hands off to the browser pre-filtered by the query. Empty query → full browser.
     A year-shaped positional token (`year_token`, `^(19|20)\d{2}$`) is rejected
     up front with a hint to use `--year` (seasons are chosen with the flag, never
-    positionally). `--start-at` past the recording end also bails with a hint,
-    and the live next-session hint rolls over to `year + 1` once a season ends.
+    positionally). `--speed` is parsed as a finite multiplier in the inclusive
+    range 0.5–120. `--start-at` uses checked arithmetic, rejects invalid minute/
+    second fields and overflow, and a value past the recording end bails with a
+    hint. The live next-session hint rolls over to `year + 1` once a season ends.
   - `browse` — interactive race → session picker; future sessions
     (`session.date > today`) are shown dimmed and can't be selected.
   - `print_schedule` — `replay --list`, prints the schedule (replaces the old
@@ -41,7 +55,11 @@ draining the channel each frame (~30 fps).
     wipes everything, or with `--year` only that season's session streams
     (their `cache_id`s are `{year}-`-prefixed). `fmt_bytes` humanizes sizes.
 - `src/message.rs` — `FeedMessage`, `SourceEvent`
-  (Message/Info/Clock/Circuit/Reset/NextSession/Ended), `PlaybackControl`
+  (Message/Info/Clock/Circuit/Reset/NextSession/Ended), `PlaybackControl`, and
+  the queue capacities (`EVENT_CHANNEL_CAPACITY = 4096`,
+  `CONTROL_CHANNEL_CAPACITY = 64`). Circuit events carry `{ key, year, data }`
+  rather than untagged JSON, so the UI can reject a response from an earlier
+  session. `PlaybackControl`
   (SetSpeed/TogglePause/Jump/JumpBack/SeekTo). `Reset` is emitted
   by `live::run` on every reconnect after the first *and* by `replay::play` on
   a rewind, telling the UI to drop stale merged state before the fresh backlog
@@ -57,14 +75,17 @@ draining the channel each frame (~30 fps).
 - `merge.rs` — the F1 feed sends full snapshots then delta patches. `merge()`
   implements the convention: objects merge recursively; arrays are patched by
   objects keyed with numeric index strings (`{"3": {...}}` updates/appends
-  element 3); scalars replace. Unit-tested.
+  element 3); scalars replace. It returns a validity flag and rejects array
+  indices above 65,535 before mutation, preventing sparse patches from forcing
+  unbounded allocation. Unit-tested.
 - `mod.rs` — `SessionState`: one merged JSON tree per topic in a `HashMap`,
   plus a specially-maintained `positions: HashMap<car#, CarPosition>` (Position
   batches are telemetry, not state, so they bypass the merge). `.z` topics
   (e.g. `Position.z`) are base64 + raw-deflate JSON, inflated in `inflate_topic`;
-  inflate failures bump `dropped` (surfaced in the footer) instead of vanishing.
-  `dirty` flag gates view rebuilds. `reset()` clears topics/positions (keeping
-  `dropped`) on live reconnect.
+  decompressed output is capped at 32 MiB before UTF-8/JSON parsing. Inflate and
+  invalid-merge failures bump `dropped` (surfaced in the footer) instead of
+  vanishing. `dirty` gates view rebuilds. `reset()` clears topics/positions
+  (keeping `dropped`) on live reconnect.
 - `view.rs` — pure extraction from the JSON trees into typed structs the UI
   renders: `ViewModel { rows, race_control, cars, weather, lap, track_flag, … }`.
   Handles both race fields (`GapToLeader`, `IntervalToPositionAhead`) and quali
@@ -78,6 +99,8 @@ draining the channel each frame (~30 fps).
   chatter are noise). Per-row enrichment: `speeds` (I1/I2/FL/ST speed trap with
   PB/OB flags), `segment_bests` (Q1/Q2/Q3 bests from `BestLapTimes`), and
   `pit_time` (pit-lane time from `PitLaneTimeCollection.PitTimes[num].Duration`).
+  Team-color parsing validates the complete six-byte ASCII hexadecimal string
+  before slicing, so malformed UTF-8 cannot panic.
   `yellow_sectors: HashSet<i64>` is folded over the ordered RaceControlMessages
   log — `(DOUBLE) YELLOW / CLEAR IN TRACK SECTOR n` add/remove n, a track-scope
   `GREEN` flag clears all — and is forced empty under SC/VSC/red (the whole-track
@@ -91,9 +114,15 @@ draining the channel each frame (~30 fps).
 - `archive.rs` — static archive client for `livetiming.formula1.com/static`:
   per-topic `.jsonStream` files (`TOPICS`, incl. `PitLaneTimeCollection` for pit
   times), on-disk cache under the platform cache dir. Responses are BOM-prefixed
-  — always `strip_bom`. Missing topics return 403 *or* 404; both mean "not
-  available", so older archives without `PitLaneTimeCollection` degrade cleanly. Also fetches circuit outlines from
-  `api.multiviewer.app` (cached). `Session` is schedule-reconstructed (no index):
+  — always `strip_bom`. Only 403 and 404 mean "not available"; authentication,
+  throttling, and server errors propagate. The HTTP client has a 15-second
+  connect timeout and 120-second request timeout. Bodies are read incrementally
+  with limits: 256 MiB per topic and 8 MiB for schedules/circuits. Cached and
+  downloaded streams must contain at least one valid timestamped JSON record;
+  circuit coordinates must be matching finite numeric arrays. Corrupt caches
+  are removed and refetched, and validated data is atomically published. Also
+  fetches circuit outlines from `api.multiviewer.app` (cached). `Session` is
+  schedule-reconstructed (no index):
   `Session::reconstructed(...)` builds one from a path, with a `cache_id` naming
   its on-disk stream cache. (Discovery no longer reads `Index.json`.) Cache
   management: `cache_dir()`, `cache_usage() -> CacheUsage` (recursive `dir_size`
@@ -106,13 +135,18 @@ draining the channel each frame (~30 fps).
   `{year}/{race_date}_{Meeting_Name}/{session_date}_{Session_Name}/` — meeting
   folder uses the race (Sunday) date, each session folder its own date, names are
   spaces→underscores with UTF-8 preserved (`São_Paulo_Grand_Prix`). Sprint
-  weekends emit Sprint Qualifying/Sprint in chronological order. Query matching
+  weekends preserve the archive-era name (`Sprint Shootout` in 2023,
+  `Sprint Qualifying` from 2024) and sort sessions by `(date, UTC time, name)`.
+  Query matching
   lives here too: `ScheduledRace::haystack` (race name + circuit id + locality +
   country), an `ALIASES`/`expand_query` nickname layer, `is_available(today)` for
   the future-session gate, and a shared `matches(expanded)` used by both the
   direct resolver and the browser.
-- `replay.rs` — parses `.jsonStream` lines (`HH:MM:SS.mmm{json}` — 12-char
-  timestamp prefix), merge-sorts all topics by offset, and plays them back in
+- `stream.rs` — the shared defensive `.jsonStream` line parser. It validates the
+  exact `HH:MM:SS.mmm` separators and fields with checked timestamp arithmetic,
+  tolerates BOM/CR boundaries, and accepts a record only when its JSON parses.
+- `replay.rs` — uses `stream.rs`, reports malformed-line counts per topic,
+  merge-sorts all valid records by offset, and plays them back in
   sim time. Playback is driven by an index **cursor** into the retained
   `Vec<ReplayEntry>` (not a consuming iterator) so backward seeks work.
   Pause/speed/jump arrive via a tokio mpsc control channel; a forward `Jump`
@@ -127,7 +161,7 @@ draining the channel each frame (~30 fps).
   trailing `CATCHUP_POSITION_KEEP` (50) `Position.z` messages are forwarded —
   Position is cumulative per car, and each skipped message saves the UI a
   base64+inflate — and every `CATCHUP_POLL_EVERY` (4096) sends it polls the
-  control channel, so key mashing folds into one replay whether the extra
+  bounded control channel, so key mashing folds into one replay whether the extra
   seeks land mid-pass or between passes. Jump/JumpBack/SeekTo leave
   the paused flag alone (seek-while-paused scrubs the state, then keeps
   waiting); the UI mirrors this by never touching `app.paused` on seeks. Past
@@ -152,7 +186,9 @@ draining the channel each frame (~30 fps).
   target `feed` carry `[topic, data, utc]`, type 3 completion carries the
   initial snapshot map. Sends `{"type":6}` pings every 15 s; the ping tick
   doubles as the watchdog (bails if `last_data` is >90 s stale), and any error
-  triggers a reconnect that first emits `SourceEvent::Reset`.
+  triggers a reconnect that first emits `SourceEvent::Reset`. WebSocket setup is
+  capped at 30 seconds; frames are limited to 16 MiB and complete messages to
+  32 MiB. Awaited sends apply backpressure through the bounded event channel.
 
 ### UI (`src/ui/`)
 
@@ -162,14 +198,19 @@ Hierarchy over density — gaps/intervals get the space, transient detail
 control noise is filtered into an overlay.
 
 - `mod.rs` — `App` state, event loop (drain channel → rebuild view if dirty →
-  draw → poll keys). Layout: status bar (1 row) / body / race-control ticker
+  draw → poll keys). A `RestoreGuard` owns `ratatui::restore`, guaranteeing
+  terminal restoration on normal exit and every propagated draw/input error.
+  Layout: status bar (1 row) / body / race-control ticker
   (1 row) / footer (1 row). Side column (map over driver panel) only when
   width ≥ 100. `↑↓` selects a driver; selection is tracked by TLA
   (`selected_tla`) so it follows the driver through position changes. `r`
   toggles the race-control overlay (then `↑↓` scrolls it); `q` and `Esc` both
   close the topmost overlay before quitting. Circuit-outline fetch retries up
   to 3× (15s apart) via `circuit_attempts`/`circuit_last_try` so one failure
-  doesn't leave the session mapless. After each view rebuild the loop diffs
+  doesn't leave the session mapless. `track_id` and `requested_track_id` bind
+  the map to `(circuit key, year)`: a concrete identity change clears the old
+  map, stale tagged responses are rejected, and an identity-less replay reset
+  retains the same-track map. After each view rebuild the loop diffs
   against the previous frame to drive App-side trackers: `pos_flash` (TLA →
   ▲/▼ direction, 3s), `lap_flash` (just-completed lap for the quali live-lap
   column, 5s), `pit_flash` (final pit-lane time flashed in the INT cell on the
@@ -191,8 +232,10 @@ control noise is filtered into an overlay.
   Terminal.app doesn't), `0` (restart from the very beginning via
   `SeekTo(0)`), and `g` (restart at the green flag via `SeekTo(green)`, the
   offset `main.rs` passes in). Seeks do **not**
-  touch pause — a paused session scrubs; `m` cycles the view; `?` toggles the
-  help overlay.
+  touch pause — a paused session scrubs. Pause/speed UI state changes only after
+  the corresponding bounded control `try_send` succeeds, preventing producer/
+  UI state drift under saturation. `m` cycles the view; `?` toggles the help
+  overlay.
   `color(r,g,b)` builds a `Color`, quantizing to the xterm-256 cube when
   `COLORTERM` doesn't advertise truecolor (every `Color::Rgb` routes through it).
 - `header.rs` — one-line status bar: flag chip · session-type chip
@@ -222,7 +265,10 @@ control noise is filtered into an overlay.
   arrays, `corners`, `marshalSectors`, `rotation` in degrees), rotates
   everything around the bbox center, densifies the outline, and renders on a
   braille Canvas with data-units-per-dot equalized on both axes so the circuit
-  keeps its shape. `sector_ranges` maps each marshal sector to the outline-point
+  keeps its shape. Parsing is all-or-nothing for numeric coordinates/markers,
+  rejects non-finite or degenerate geometry, caps source coordinates at 100,000,
+  and aborts densification above 200,000 points. `sector_ranges` maps each
+  marshal sector to the outline-point
   index range it covers (each sector's marker projected to the nearest point,
   ranges running to the next sector); points inside an active `yellow_sectors`
   entry paint yellow, thickened per-slice so colors don't bleed. A short white
@@ -237,14 +283,18 @@ control noise is filtered into an overlay.
 - One canonical state; the UI never touches raw feed JSON — only `view.rs` does.
 - Feed values are pre-formatted strings (`"1:32.807"`, `"+2.502"`, `"LAP 12"`
   for the leader); display them verbatim, don't parse.
-- The channel from source to UI is unbounded; the UI drains up to `DRAIN_CAP`
-  (20k) messages per frame so seek/catch-up bursts don't freeze rendering, and
-  when a frame hits the cap it polls input with a zero timeout so the rest of
-  the backlog drains at full speed instead of one cap per 33 ms frame.
+- The source-to-UI channel is bounded at 4,096 events and all async producers
+  await capacity. The UI drains up to `DRAIN_CAP` (20k) messages per frame so
+  seek/catch-up bursts don't freeze rendering; when a frame hits the cap it
+  polls input with a zero timeout so the backlog drains at full speed instead
+  of one cap per 33 ms frame. Replay controls are independently bounded at 64.
 - `view.rs` extraction is unit-tested (`build_rows` race/quali/knocked-out,
   speeds + segment bests, pit time, the `yellow_sectors` fold, `quali_cutoff`
   matrix, `parse_laptime`, `stints_from`, `first_nonempty`, `cutoff_time`); the
   256-color `quantize_256` and the CLI `year_token` detector are too, as are
-  merge and schedule matching. CI (`.github/workflows/
-  ci.yml`) runs `cargo fmt --check` + `clippy -D warnings` + `test` on Linux and
-  macOS, plus a Windows build-only job, pinned to Rust 1.88.
+  merge and schedule matching. CI (`.github/workflows/ci.yml`) grants read-only
+  repository access by default, pins third-party actions to immutable commit
+  SHAs, runs `cargo fmt --check` + `clippy -D warnings` + `test` on Linux and
+  macOS, plus a Windows build-only job, pinned to Rust 1.88. A separate Linux
+  RustSec job audits `Cargo.lock`; vulnerabilities fail the check while
+  informational advisories remain visible.

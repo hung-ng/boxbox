@@ -623,7 +623,7 @@ fn first_nonempty(opts: &[Option<String>]) -> String {
 
 fn parse_hex_color(hex: &str) -> Option<(u8, u8, u8)> {
     let h = hex.trim_start_matches('#');
-    if h.len() != 6 {
+    if h.len() != 6 || !h.is_ascii() || !h.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     Some((
@@ -697,6 +697,11 @@ mod tests {
         assert_eq!(parse_laptime("58.123"), Some(58.123));
         assert_eq!(parse_laptime(""), None);
         assert_eq!(parse_laptime("--"), None);
+    }
+
+    #[test]
+    fn non_ascii_six_byte_color_is_rejected_without_panicking() {
+        assert_eq!(parse_hex_color("aéabc"), None);
     }
 
     #[test]

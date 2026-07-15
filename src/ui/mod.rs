@@ -14,9 +14,8 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::TableState;
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 /// A driver's position moved up (gained places) or down since the last frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +77,10 @@ pub struct App {
     /// session its map. Retry up to `CIRCUIT_MAX_ATTEMPTS`, `CIRCUIT_RETRY` apart.
     circuit_attempts: u8,
     circuit_last_try: Option<Instant>,
+    /// Identity of the installed and most recently requested circuit outlines.
+    /// Responses are tagged and checked against the current ViewModel identity.
+    track_id: Option<(i64, i64)>,
+    requested_track_id: Option<(i64, i64)>,
     /// TLA holding the session-best lap, and when it was last claimed — drives
     /// the ~1s magenta pulse on the map when a new overall best appears.
     last_fastest_tla: Option<String>,
@@ -114,6 +117,80 @@ const CIRCUIT_MAX_ATTEMPTS: u8 = 3;
 const CIRCUIT_RETRY: Duration = Duration::from_secs(15);
 
 impl App {
+    fn new(is_replay: bool, initial_speed: f64, total: Option<Duration>) -> Self {
+        Self {
+            state: SessionState::default(),
+            vm: view::ViewModel::default(),
+            is_replay,
+            speed: initial_speed,
+            paused: false,
+            sim_clock: None,
+            total,
+            status: String::new(),
+            view_override: None,
+            selected: 0,
+            selected_tla: None,
+            rc_open: false,
+            rc_scroll: 0,
+            help_open: false,
+            track: None,
+            ended: false,
+            circuit_attempts: 0,
+            circuit_last_try: None,
+            track_id: None,
+            requested_track_id: None,
+            last_fastest_tla: None,
+            fastest_since: None,
+            table_state: TableState::default(),
+            pos_flash: HashMap::new(),
+            prev_positions: HashMap::new(),
+            lap_flash: HashMap::new(),
+            prev_last_lap: HashMap::new(),
+            pit_flash: HashMap::new(),
+            prev_pit_time: HashMap::new(),
+            pit_lane: Vec::new(),
+            clock_base: None,
+            clock_at_wall: None,
+            clock_at_sim: None,
+            prev_clock: None,
+            next_session: None,
+        }
+    }
+
+    fn circuit_identity(&self) -> Option<(i64, i64)> {
+        Some((self.vm.circuit_key?, self.vm.year?))
+    }
+
+    /// Clear an installed map only when a different concrete session identity
+    /// appears. A transient identity-less replay reset keeps the same map.
+    fn sync_circuit_identity(&mut self) {
+        let Some(current) = self.circuit_identity() else {
+            return;
+        };
+        let known = self.track_id.or(self.requested_track_id);
+        if known.is_some() && known != Some(current) {
+            self.track = None;
+            self.track_id = None;
+            self.requested_track_id = None;
+            self.circuit_attempts = 0;
+            self.circuit_last_try = None;
+        }
+    }
+
+    fn accept_circuit(&mut self, key: i64, year: i64, data: &serde_json::Value) -> bool {
+        let identity = (key, year);
+        if self.circuit_identity() != Some(identity) {
+            return false;
+        }
+        let Some(track) = map::TrackOutline::parse(data) else {
+            return false;
+        };
+        self.track = Some(track);
+        self.track_id = Some(identity);
+        self.requested_track_id = Some(identity);
+        true
+    }
+
     /// TLA of the driver the map should spotlight: the explicitly-followed one,
     /// else whatever row the cursor currently sits on.
     pub fn selected_tla(&self) -> Option<String> {
@@ -221,13 +298,38 @@ fn parse_clock(s: &str) -> Option<Duration> {
     let h: u64 = parts.next()?.trim().parse().ok()?;
     let m: u64 = parts.next()?.parse().ok()?;
     let sec: u64 = parts.next()?.parse().ok()?;
-    Some(Duration::from_secs(h * 3600 + m * 60 + sec))
+    if parts.next().is_some() || m >= 60 || sec >= 60 {
+        return None;
+    }
+    let seconds = h
+        .checked_mul(3600)?
+        .checked_add(m.checked_mul(60)?)?
+        .checked_add(sec)?;
+    Some(Duration::from_secs(seconds))
+}
+
+/// Runs terminal restoration on every exit path, including errors propagated by
+/// drawing or input handling.
+struct RestoreGuard<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> RestoreGuard<F> {
+    fn new(restore: F) -> Self {
+        Self(Some(restore))
+    }
+}
+
+impl<F: FnOnce()> Drop for RestoreGuard<F> {
+    fn drop(&mut self) {
+        if let Some(restore) = self.0.take() {
+            restore();
+        }
+    }
 }
 
 pub fn run(
-    rx: Receiver<SourceEvent>,
+    mut rx: Receiver<SourceEvent>,
     tx: Sender<SourceEvent>,
-    ctrl: Option<UnboundedSender<PlaybackControl>>,
+    ctrl: Option<Sender<PlaybackControl>>,
     rt: tokio::runtime::Handle,
     initial_speed: f64,
     total: Option<Duration>,
@@ -235,47 +337,14 @@ pub fn run(
     green: Option<Duration>,
 ) -> Result<()> {
     let mut terminal = ratatui::init();
-    let mut app = App {
-        state: SessionState::default(),
-        vm: view::ViewModel::default(),
-        is_replay: ctrl.is_some(),
-        speed: initial_speed,
-        paused: false,
-        sim_clock: None,
-        total,
-        status: String::new(),
-        view_override: None,
-        selected: 0,
-        selected_tla: None,
-        rc_open: false,
-        rc_scroll: 0,
-        help_open: false,
-        track: None,
-        ended: false,
-        circuit_attempts: 0,
-        circuit_last_try: None,
-        last_fastest_tla: None,
-        fastest_since: None,
-        table_state: TableState::default(),
-        pos_flash: HashMap::new(),
-        prev_positions: HashMap::new(),
-        lap_flash: HashMap::new(),
-        prev_last_lap: HashMap::new(),
-        pit_flash: HashMap::new(),
-        prev_pit_time: HashMap::new(),
-        pit_lane: Vec::new(),
-        clock_base: None,
-        clock_at_wall: None,
-        clock_at_sim: None,
-        prev_clock: None,
-        next_session: None,
-    };
+    let _restore = RestoreGuard::new(ratatui::restore);
+    let mut app = App::new(ctrl.is_some(), initial_speed, total);
 
     // Per-frame feed-drain cap, so rendering never starves during a seek's
     // fast-applied backlog.
     const DRAIN_CAP: usize = 20_000;
 
-    let result = loop {
+    loop {
         // Drain pending feed messages (bounded per frame so rendering never starves).
         let mut drained = 0;
         while drained < DRAIN_CAP {
@@ -283,8 +352,8 @@ pub fn run(
                 Ok(SourceEvent::Message(msg)) => app.state.apply(msg),
                 Ok(SourceEvent::Info(s)) => app.status = s,
                 Ok(SourceEvent::Clock(t)) => app.sim_clock = Some(t),
-                Ok(SourceEvent::Circuit(v)) => {
-                    app.track = map::TrackOutline::parse(&v);
+                Ok(SourceEvent::Circuit { key, year, data }) => {
+                    app.accept_circuit(key, year, &data);
                 }
                 Ok(SourceEvent::NextSession(s)) => app.next_session = Some(s),
                 Ok(SourceEvent::Reset) => {
@@ -331,6 +400,7 @@ pub fn run(
         if app.state.dirty {
             app.state.dirty = false;
             app.vm = view::build(&app.state);
+            app.sync_circuit_identity();
             // A new session-best lap-holder starts the pulse; ignore the first
             // appearance so we don't flash on initial data load.
             let fastest_tla = app.vm.fastest.as_ref().map(|(_, tla)| tla.clone());
@@ -427,10 +497,10 @@ pub fn run(
             }
 
             // Keep the focus on the same driver as positions shuffle.
-            if let Some(tla) = &app.selected_tla {
-                if let Some(i) = app.vm.rows.iter().position(|r| &r.tla == tla) {
-                    app.selected = i;
-                }
+            if let Some(tla) = &app.selected_tla
+                && let Some(i) = app.vm.rows.iter().position(|r| &r.tla == tla)
+            {
+                app.selected = i;
             }
             app.selected = app.selected.min(app.vm.rows.len().saturating_sub(1));
         }
@@ -438,24 +508,26 @@ pub fn run(
         // Kick off (and retry) the circuit outline fetch once we know which
         // track this is. A single transient failure shouldn't leave the session
         // mapless, so retry a few times before giving up silently.
-        if app.track.is_none() && app.circuit_attempts < CIRCUIT_MAX_ATTEMPTS {
-            if let (Some(key), Some(year)) = (app.vm.circuit_key, app.vm.year) {
-                let due = app
-                    .circuit_last_try
-                    .map(|t| t.elapsed() >= CIRCUIT_RETRY)
-                    .unwrap_or(true);
-                if due {
-                    app.circuit_attempts += 1;
-                    app.circuit_last_try = Some(Instant::now());
-                    let tx = tx.clone();
-                    rt.spawn(async move {
-                        if let Ok(archive) = Archive::new() {
-                            if let Ok(v) = archive.circuit_outline(key, year).await {
-                                let _ = tx.send(SourceEvent::Circuit(v));
-                            }
-                        }
-                    });
-                }
+        if app.track.is_none()
+            && app.circuit_attempts < CIRCUIT_MAX_ATTEMPTS
+            && let (Some(key), Some(year)) = (app.vm.circuit_key, app.vm.year)
+        {
+            let due = app
+                .circuit_last_try
+                .map(|t| t.elapsed() >= CIRCUIT_RETRY)
+                .unwrap_or(true);
+            if due {
+                app.circuit_attempts += 1;
+                app.circuit_last_try = Some(Instant::now());
+                app.requested_track_id = Some((key, year));
+                let tx = tx.clone();
+                rt.spawn(async move {
+                    if let Ok(archive) = Archive::new()
+                        && let Ok(v) = archive.circuit_outline(key, year).await
+                    {
+                        let _ = tx.send(SourceEvent::Circuit { key, year, data: v }).await;
+                    }
+                });
             }
         }
 
@@ -470,117 +542,119 @@ pub fn run(
         } else {
             Duration::from_millis(33)
         };
-        if event::poll(poll_timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
-                    // `q` and Esc both close the topmost overlay first, then quit.
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        if app.help_open {
-                            app.help_open = false;
-                        } else if app.rc_open {
-                            app.rc_open = false;
-                        } else {
-                            break Ok(());
-                        }
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        if event::poll(poll_timeout)?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                // `q` and Esc both close the topmost overlay first, then quit.
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    if app.help_open {
+                        app.help_open = false;
+                    } else if app.rc_open {
+                        app.rc_open = false;
+                    } else {
                         break Ok(());
                     }
-                    KeyCode::Char('r') => {
-                        app.rc_open = !app.rc_open;
-                        app.rc_scroll = 0;
-                    }
-                    KeyCode::Char('?') => {
-                        app.help_open = !app.help_open;
-                    }
-                    KeyCode::Up => {
-                        if app.rc_open {
-                            app.rc_scroll = app.rc_scroll.saturating_add(1);
-                        } else if app.selected > 0 {
-                            app.selected -= 1;
-                            app.selected_tla = app.vm.rows.get(app.selected).map(|r| r.tla.clone());
-                        }
-                    }
-                    KeyCode::Down => {
-                        if app.rc_open {
-                            app.rc_scroll = app.rc_scroll.saturating_sub(1);
-                        } else if app.selected + 1 < app.vm.rows.len() {
-                            app.selected += 1;
-                            app.selected_tla = app.vm.rows.get(app.selected).map(|r| r.tla.clone());
-                        }
-                    }
-                    KeyCode::Char(' ') => {
-                        if let Some(ctrl) = &ctrl {
-                            app.paused = !app.paused;
-                            let _ = ctrl.send(PlaybackControl::TogglePause);
-                        }
-                    }
-                    KeyCode::Char('+') | KeyCode::Char('=') => {
-                        app.speed = step_speed(app.speed, true);
-                        if let Some(ctrl) = &ctrl {
-                            let _ = ctrl.send(PlaybackControl::SetSpeed(app.speed));
-                        }
-                    }
-                    KeyCode::Char('-') => {
-                        app.speed = step_speed(app.speed, false);
-                        if let Some(ctrl) = &ctrl {
-                            let _ = ctrl.send(PlaybackControl::SetSpeed(app.speed));
-                        }
-                    }
-                    // ←/→ seek 1 min, Shift+←/→ 5 min. `,`/`.` are modifier-free
-                    // 5-min aliases: not every terminal reports Shift on arrow
-                    // keys (macOS Terminal.app doesn't). Seeks move the timeline
-                    // without touching pause, so a paused session can be
-                    // scrubbed frame by frame.
-                    KeyCode::Left | KeyCode::Right | KeyCode::Char(',') | KeyCode::Char('.') => {
-                        if let Some(ctrl) = &ctrl {
-                            let five = matches!(key.code, KeyCode::Char(_))
-                                || key.modifiers.contains(KeyModifiers::SHIFT);
-                            let d = Duration::from_secs(if five { 300 } else { 60 });
-                            let back = matches!(key.code, KeyCode::Left | KeyCode::Char(','));
-                            let _ = ctrl.send(if back {
-                                PlaybackControl::JumpBack(d)
-                            } else {
-                                PlaybackControl::Jump(d)
-                            });
-                        }
-                    }
-                    // Restart from the very beginning (before the green-flag
-                    // auto-seek point).
-                    KeyCode::Char('0') => {
-                        if let Some(ctrl) = &ctrl {
-                            let _ = ctrl.send(PlaybackControl::SeekTo(Duration::ZERO));
-                        }
-                    }
-                    // Restart at the green flag, mirroring the --start-at default
-                    // (0:00 for recordings that never report a start).
-                    KeyCode::Char('g') => {
-                        if let Some(ctrl) = &ctrl {
-                            let _ =
-                                ctrl.send(PlaybackControl::SeekTo(green.unwrap_or(Duration::ZERO)));
-                        }
-                    }
-                    KeyCode::Char('m') => {
-                        // Cycle Split → MapOnly → TowerOnly → auto, starting from
-                        // whatever is currently on screen.
-                        let cur = app.view_override.unwrap_or(auto_mode(&app, size));
-                        app.view_override = match cur {
-                            ViewMode::Split => Some(ViewMode::MapOnly),
-                            ViewMode::MapOnly => Some(ViewMode::TowerOnly),
-                            ViewMode::TowerOnly => None,
-                        };
-                    }
-                    _ => {}
                 }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    break Ok(());
+                }
+                KeyCode::Char('r') => {
+                    app.rc_open = !app.rc_open;
+                    app.rc_scroll = 0;
+                }
+                KeyCode::Char('?') => {
+                    app.help_open = !app.help_open;
+                }
+                KeyCode::Up => {
+                    if app.rc_open {
+                        app.rc_scroll = app.rc_scroll.saturating_add(1);
+                    } else if app.selected > 0 {
+                        app.selected -= 1;
+                        app.selected_tla = app.vm.rows.get(app.selected).map(|r| r.tla.clone());
+                    }
+                }
+                KeyCode::Down => {
+                    if app.rc_open {
+                        app.rc_scroll = app.rc_scroll.saturating_sub(1);
+                    } else if app.selected + 1 < app.vm.rows.len() {
+                        app.selected += 1;
+                        app.selected_tla = app.vm.rows.get(app.selected).map(|r| r.tla.clone());
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(ctrl) = &ctrl
+                        && ctrl.try_send(PlaybackControl::TogglePause).is_ok()
+                    {
+                        app.paused = !app.paused;
+                    }
+                }
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    if let Some(ctrl) = &ctrl {
+                        let speed = step_speed(app.speed, true);
+                        if ctrl.try_send(PlaybackControl::SetSpeed(speed)).is_ok() {
+                            app.speed = speed;
+                        }
+                    }
+                }
+                KeyCode::Char('-') => {
+                    if let Some(ctrl) = &ctrl {
+                        let speed = step_speed(app.speed, false);
+                        if ctrl.try_send(PlaybackControl::SetSpeed(speed)).is_ok() {
+                            app.speed = speed;
+                        }
+                    }
+                }
+                // ←/→ seek 1 min, Shift+←/→ 5 min. `,`/`.` are modifier-free
+                // 5-min aliases: not every terminal reports Shift on arrow
+                // keys (macOS Terminal.app doesn't). Seeks move the timeline
+                // without touching pause, so a paused session can be
+                // scrubbed frame by frame.
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(',') | KeyCode::Char('.') => {
+                    if let Some(ctrl) = &ctrl {
+                        let five = matches!(key.code, KeyCode::Char(_))
+                            || key.modifiers.contains(KeyModifiers::SHIFT);
+                        let d = Duration::from_secs(if five { 300 } else { 60 });
+                        let back = matches!(key.code, KeyCode::Left | KeyCode::Char(','));
+                        let _ = ctrl.try_send(if back {
+                            PlaybackControl::JumpBack(d)
+                        } else {
+                            PlaybackControl::Jump(d)
+                        });
+                    }
+                }
+                // Restart from the very beginning (before the green-flag
+                // auto-seek point).
+                KeyCode::Char('0') => {
+                    if let Some(ctrl) = &ctrl {
+                        let _ = ctrl.try_send(PlaybackControl::SeekTo(Duration::ZERO));
+                    }
+                }
+                // Restart at the green flag, mirroring the --start-at default
+                // (0:00 for recordings that never report a start).
+                KeyCode::Char('g') => {
+                    if let Some(ctrl) = &ctrl {
+                        let _ =
+                            ctrl.try_send(PlaybackControl::SeekTo(green.unwrap_or(Duration::ZERO)));
+                    }
+                }
+                KeyCode::Char('m') => {
+                    // Cycle Split → MapOnly → TowerOnly → auto, starting from
+                    // whatever is currently on screen.
+                    let cur = app.view_override.unwrap_or(auto_mode(&app, size));
+                    app.view_override = match cur {
+                        ViewMode::Split => Some(ViewMode::MapOnly),
+                        ViewMode::MapOnly => Some(ViewMode::TowerOnly),
+                        ViewMode::TowerOnly => None,
+                    };
+                }
+                _ => {}
             }
         }
-    };
-
-    ratatui::restore();
-    result
+    }
 }
 
 fn step_speed(cur: f64, up: bool) -> f64 {
@@ -812,7 +886,70 @@ fn footer(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
 #[cfg(test)]
 mod tests {
-    use super::quantize_256;
+    use super::{App, RestoreGuard, parse_clock, quantize_256};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn restore_guard_runs_cleanup_when_scope_returns_error() {
+        let restored = Arc::new(AtomicBool::new(false));
+        let seen = restored.clone();
+        let result: anyhow::Result<()> = (|| {
+            let _guard = RestoreGuard::new(move || {
+                seen.store(true, Ordering::SeqCst);
+            });
+            anyhow::bail!("draw failed")
+        })();
+
+        assert!(result.is_err());
+        assert!(restored.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn feed_clock_rejects_invalid_fields_and_overflow() {
+        assert_eq!(parse_clock("1:02:03"), Some(Duration::from_secs(3723)));
+        assert_eq!(parse_clock("1:60:00"), None);
+        assert_eq!(parse_clock("1:00:60"), None);
+        assert_eq!(parse_clock("1:02:03:04"), None);
+        assert_eq!(parse_clock("18446744073709551615:00:00"), None);
+    }
+
+    fn circuit() -> serde_json::Value {
+        json!({"x": [0.0, 1.0, 2.0], "y": [0.0, 1.0, 0.0]})
+    }
+
+    #[test]
+    fn circuit_identity_rejects_stale_response() {
+        let mut app = App::new(false, 1.0, None);
+        app.vm.circuit_key = Some(7);
+        app.vm.year = Some(2026);
+        app.requested_track_id = Some((7, 2026));
+
+        assert!(!app.accept_circuit(3, 2025, &circuit()));
+        assert!(app.track.is_none());
+        assert!(app.accept_circuit(7, 2026, &circuit()));
+        assert_eq!(app.track_id, Some((7, 2026)));
+    }
+
+    #[test]
+    fn circuit_identity_changes_clear_old_track() {
+        let mut app = App::new(false, 1.0, None);
+        app.vm.circuit_key = Some(7);
+        app.vm.year = Some(2026);
+        app.requested_track_id = Some((7, 2026));
+        assert!(app.accept_circuit(7, 2026, &circuit()));
+
+        app.vm.circuit_key = Some(8);
+        app.vm.year = Some(2026);
+        app.sync_circuit_identity();
+
+        assert!(app.track.is_none());
+        assert_eq!(app.track_id, None);
+        assert_eq!(app.requested_track_id, None);
+        assert_eq!(app.circuit_attempts, 0);
+    }
 
     #[test]
     fn quantize_256_known_pairs() {

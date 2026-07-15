@@ -2,15 +2,17 @@ use crate::message::{FeedMessage, SourceEvent};
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::Sender;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 // F1 moved live timing to SignalR Core (the classic /signalr endpoint 401s).
 const NEGOTIATE_URL: &str =
     "https://livetiming.formula1.com/signalrcore/negotiate?negotiateVersion=1";
 const CONNECT_URL: &str = "wss://livetiming.formula1.com/signalrcore";
+const NEGOTIATE_MAX_BYTES: usize = 1024 * 1024;
 
 /// SignalR Core frames are JSON records terminated by 0x1e.
 const RECORD_SEP: char = '\u{1e}';
@@ -39,12 +41,13 @@ pub async fn run(tx: Sender<SourceEvent>) {
         // On every attempt after the first, the next connection delivers a fresh
         // full snapshot; tell the UI to drop stale state so removed keys don't
         // linger from the previous session's tree (plan 2.9).
-        if !first && tx.send(SourceEvent::Reset).is_err() {
+        if !first && tx.send(SourceEvent::Reset).await.is_err() {
             return;
         }
         first = false;
         if tx
             .send(SourceEvent::Info("connecting to live feed…".into()))
+            .await
             .is_err()
         {
             return;
@@ -56,6 +59,7 @@ pub async fn run(tx: Sender<SourceEvent>) {
                     .send(SourceEvent::Info(format!(
                         "feed error: {e:#} — reconnecting in 5s"
                     )))
+                    .await
                     .is_err()
                 {
                     return;
@@ -69,6 +73,8 @@ pub async fn run(tx: Sender<SourceEvent>) {
 async fn connect_and_stream(tx: &Sender<SourceEvent>) -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("boxbox/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(120))
         .build()?;
     let resp = client
         .post(NEGOTIATE_URL)
@@ -83,7 +89,8 @@ async fn connect_and_stream(tx: &Sender<SourceEvent>) -> Result<()> {
         .filter_map(|v| v.split(';').next())
         .map(str::to_string)
         .collect();
-    let negotiation: Value = resp.json().await?;
+    let negotiation: Value =
+        serde_json::from_slice(&super::archive::read_limited(resp, NEGOTIATE_MAX_BYTES).await?)?;
     let token = negotiation["connectionToken"]
         .as_str()
         .context("negotiate response missing connectionToken")?;
@@ -95,7 +102,15 @@ async fn connect_and_stream(tx: &Sender<SourceEvent>) -> Result<()> {
             .headers_mut()
             .insert("Cookie", cookies.join("; ").parse()?);
     }
-    let (mut ws, _) = tokio_tungstenite::connect_async(request).await?;
+    let config = WebSocketConfig::default()
+        .max_frame_size(Some(16 * 1024 * 1024))
+        .max_message_size(Some(32 * 1024 * 1024));
+    let (mut ws, _) = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio_tungstenite::connect_async_with_config(request, Some(config), false),
+    )
+    .await
+    .context("websocket connection timed out")??;
 
     // Protocol handshake, then subscribe.
     ws.send(WsMessage::Text(
@@ -112,6 +127,7 @@ async fn connect_and_stream(tx: &Sender<SourceEvent>) -> Result<()> {
         .await?;
     if tx
         .send(SourceEvent::Info("live feed connected".into()))
+        .await
         .is_err()
     {
         return Ok(());
@@ -146,14 +162,14 @@ async fn connect_and_stream(tx: &Sender<SourceEvent>) -> Result<()> {
             let Ok(v) = serde_json::from_str::<Value>(record) else {
                 continue;
             };
-            if handle_record(tx, &v).is_err() {
+            if handle_record(tx, &v).await.is_err() {
                 return Ok(()); // receiver hung up
             }
         }
     }
 }
 
-fn handle_record(tx: &Sender<SourceEvent>, v: &Value) -> Result<(), ()> {
+async fn handle_record(tx: &Sender<SourceEvent>, v: &Value) -> Result<(), ()> {
     match v.get("type").and_then(|t| t.as_i64()) {
         // Server-to-client invocation: feed updates.
         Some(1) => {
@@ -167,13 +183,13 @@ fn handle_record(tx: &Sender<SourceEvent>, v: &Value) -> Result<(), ()> {
             else {
                 return Ok(());
             };
-            send_msg(tx, topic.to_string(), data.clone())
+            send_msg(tx, topic.to_string(), data.clone()).await
         }
         // Completion of our Subscribe call: result holds full snapshots per topic.
         Some(3) => {
             if let Some(snapshot) = v.get("result").and_then(|r| r.as_object()) {
                 for (topic, data) in snapshot {
-                    send_msg(tx, topic.clone(), data.clone())?;
+                    send_msg(tx, topic.clone(), data.clone()).await?;
                 }
             }
             Ok(())
@@ -182,11 +198,12 @@ fn handle_record(tx: &Sender<SourceEvent>, v: &Value) -> Result<(), ()> {
     }
 }
 
-fn send_msg(tx: &Sender<SourceEvent>, topic: String, data: Value) -> Result<(), ()> {
+async fn send_msg(tx: &Sender<SourceEvent>, topic: String, data: Value) -> Result<(), ()> {
     tx.send(SourceEvent::Message(FeedMessage {
         topic,
         data,
         ts: None,
     }))
+    .await
     .map_err(|_| ())
 }

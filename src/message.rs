@@ -1,6 +1,9 @@
 use serde_json::Value;
 use std::time::Duration;
 
+pub const EVENT_CHANNEL_CAPACITY: usize = 4_096;
+pub const CONTROL_CHANNEL_CAPACITY: usize = 64;
+
 /// One update from the timing feed: a topic name and a JSON payload
 /// (either a full snapshot or a delta patch to merge).
 #[derive(Debug, Clone)]
@@ -18,8 +21,13 @@ pub enum SourceEvent {
     Info(String),
     /// Replay clock advanced (current sim offset).
     Clock(Duration),
-    /// Circuit outline JSON from the MultiViewer API.
-    Circuit(Value),
+    /// Circuit outline JSON from the MultiViewer API, tagged so a response from
+    /// an earlier session cannot replace the current track.
+    Circuit {
+        key: i64,
+        year: i64,
+        data: Value,
+    },
     /// Live feed is about to reconnect: drop merged state so removed keys from
     /// the previous session don't linger into the fresh snapshot.
     Reset,

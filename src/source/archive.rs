@@ -1,7 +1,15 @@
 use anyhow::{Context, Result, bail};
-use std::path::PathBuf;
+use reqwest::StatusCode;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 pub const BASE: &str = "https://livetiming.formula1.com/static";
+pub(crate) const SCHEDULE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const CIRCUIT_MAX_BYTES: usize = 8 * 1024 * 1024;
+const STREAM_MAX_BYTES: usize = 256 * 1024 * 1024;
+static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Feed topics we replay, in the order they matter least→most for a tie on timestamp.
 pub const TOPICS: &[&str] = &[
@@ -61,6 +69,8 @@ impl Archive {
         Ok(Self {
             client: reqwest::Client::builder()
                 .user_agent(concat!("boxbox/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(120))
                 .build()?,
             cache_dir,
         })
@@ -142,23 +152,24 @@ impl Archive {
             .join("sessions")
             .join(&session.cache_id)
             .join(format!("{topic}.jsonStream"));
-        if let Ok(cached) = std::fs::read_to_string(&cache_file) {
+        if let Some(cached) = read_cached_stream(&cache_file)? {
             return Ok(Some(cached));
         }
 
         let url = format!("{BASE}/{path}{topic}.jsonStream");
         let resp = self.client.get(&url).send().await?;
-        // Topics that don't exist for a session type surface as 404 or 403.
-        if resp.status().is_client_error() {
-            return Ok(None);
+        match classify_stream_status(resp.status()) {
+            StreamStatus::Missing => return Ok(None),
+            StreamStatus::Error => bail!("{url}: HTTP {}", resp.status()),
+            StreamStatus::Available => {}
         }
-        if !resp.status().is_success() {
-            bail!("{url}: HTTP {}", resp.status());
-        }
-        let body = resp.text().await?;
+        let body = read_limited(resp, STREAM_MAX_BYTES).await?;
+        let body = String::from_utf8(body).context("archive stream is not UTF-8")?;
         let body = strip_bom(&body).to_string();
-        std::fs::create_dir_all(cache_file.parent().unwrap())?;
-        std::fs::write(&cache_file, &body)?;
+        if !stream_body_valid(&body) {
+            bail!("{url}: stream contains no valid records");
+        }
+        atomic_write(&cache_file, body.as_bytes())?;
         Ok(Some(body))
     }
 
@@ -168,29 +179,144 @@ impl Archive {
             .cache_dir
             .join("circuits")
             .join(format!("{circuit_key}-{year}.json"));
-        if let Ok(cached) = std::fs::read_to_string(&cache_file) {
-            if let Ok(v) = serde_json::from_str(&cached) {
-                return Ok(v);
-            }
+        if let Some(cached) = read_cached_circuit(&cache_file)? {
+            return Ok(cached);
         }
         let url = format!("https://api.multiviewer.app/api/v1/circuits/{circuit_key}/{year}");
-        let body = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
+        let resp = self.client.get(&url).send().await?.error_for_status()?;
+        let body = read_limited(resp, CIRCUIT_MAX_BYTES).await?;
+        let body = String::from_utf8(body).context("circuit response is not UTF-8")?;
         let v: serde_json::Value = serde_json::from_str(strip_bom(&body))?;
-        std::fs::create_dir_all(cache_file.parent().unwrap())?;
-        std::fs::write(&cache_file, &body)?;
+        if !circuit_shape_valid(&v) {
+            bail!("{url}: invalid circuit coordinate arrays");
+        }
+        atomic_write(&cache_file, body.as_bytes())?;
         Ok(v)
     }
 }
 
 pub fn strip_bom(s: &str) -> &str {
     s.trim_start_matches('\u{feff}')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamStatus {
+    Available,
+    Missing,
+    Error,
+}
+
+fn classify_stream_status(status: StatusCode) -> StreamStatus {
+    match status {
+        StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => StreamStatus::Missing,
+        s if s.is_success() => StreamStatus::Available,
+        _ => StreamStatus::Error,
+    }
+}
+
+fn stream_body_valid(body: &str) -> bool {
+    body.lines()
+        .any(|line| super::stream::parse_line(line).is_some())
+}
+
+fn read_cached_stream(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(body) if stream_body_valid(&body) => Ok(Some(body)),
+        Ok(_) => {
+            std::fs::remove_file(path)
+                .with_context(|| format!("removing corrupt {}", path.display()))?;
+            Ok(None)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            std::fs::remove_file(path)
+                .with_context(|| format!("removing corrupt {}", path.display()))?;
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_cached_circuit(path: &Path) -> Result<Option<serde_json::Value>> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => match serde_json::from_str(&body) {
+            Ok(value) if circuit_shape_valid(&value) => Ok(Some(value)),
+            _ => {
+                std::fs::remove_file(path)
+                    .with_context(|| format!("removing corrupt {}", path.display()))?;
+                Ok(None)
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            std::fs::remove_file(path)
+                .with_context(|| format!("removing corrupt {}", path.display()))?;
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn circuit_shape_valid(v: &serde_json::Value) -> bool {
+    let (Some(xs), Some(ys)) = (
+        v.get("x").and_then(|v| v.as_array()),
+        v.get("y").and_then(|v| v.as_array()),
+    ) else {
+        return false;
+    };
+    xs.len() >= 2
+        && xs.len() == ys.len()
+        && xs
+            .iter()
+            .chain(ys)
+            .all(|v| v.as_f64().is_some_and(f64::is_finite))
+}
+
+pub(crate) async fn read_limited(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    if resp.content_length().is_some_and(|n| n > limit as u64) {
+        bail!("response exceeds {limit} bytes");
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if out.len().saturating_add(chunk.len()) > limit {
+            bail!("response exceeds {limit} bytes");
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+pub(crate) fn atomic_write(path: &Path, body: &[u8]) -> Result<()> {
+    atomic_write_with(path, |file| {
+        file.write_all(body)?;
+        Ok(())
+    })
+}
+
+fn atomic_write_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<()> {
+    let parent = path.parent().context("cache path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("cache");
+    let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{name}.tmp-{}-{id}", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        write(&mut file)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Cache disk usage broken down by category, in bytes.
@@ -220,4 +346,82 @@ fn dir_size(dir: &std::path::Path) -> u64 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::StatusCode;
+    use serde_json::json;
+
+    #[test]
+    fn stream_status_only_treats_403_and_404_as_missing() {
+        assert_eq!(
+            classify_stream_status(StatusCode::FORBIDDEN),
+            StreamStatus::Missing
+        );
+        assert_eq!(
+            classify_stream_status(StatusCode::NOT_FOUND),
+            StreamStatus::Missing
+        );
+        assert_eq!(
+            classify_stream_status(StatusCode::UNAUTHORIZED),
+            StreamStatus::Error
+        );
+        assert_eq!(
+            classify_stream_status(StatusCode::TOO_MANY_REQUESTS),
+            StreamStatus::Error
+        );
+        assert_eq!(
+            classify_stream_status(StatusCode::OK),
+            StreamStatus::Available
+        );
+    }
+
+    #[test]
+    fn circuit_shape_requires_matching_numeric_coordinates() {
+        assert!(circuit_shape_valid(
+            &json!({"x": [0.0, 1.0], "y": [2.0, 3.0]})
+        ));
+        assert!(!circuit_shape_valid(&json!({"x": [0.0], "y": [2.0]})));
+        assert!(!circuit_shape_valid(
+            &json!({"x": [0.0, "bad"], "y": [2.0, 3.0]})
+        ));
+    }
+
+    #[test]
+    fn corrupt_stream_and_circuit_caches_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let stream = dir.path().join("bad.jsonStream");
+        let circuit = dir.path().join("bad.json");
+        std::fs::write(&stream, b"not a stream").unwrap();
+        std::fs::write(&circuit, b"not json").unwrap();
+
+        assert!(read_cached_stream(&stream).unwrap().is_none());
+        assert!(read_cached_circuit(&circuit).unwrap().is_none());
+        assert!(!stream.exists());
+        assert!(!circuit.exists());
+    }
+
+    #[test]
+    fn atomic_write_publishes_complete_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        atomic_write(&path, b"new body").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new body");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn atomic_write_failure_preserves_published_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        std::fs::write(&path, b"old body").unwrap();
+
+        let result = atomic_write_with(&path, |_| anyhow::bail!("injected write failure"));
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"old body");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 }

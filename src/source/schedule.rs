@@ -11,7 +11,7 @@
 //! uses its own date. Meeting/session names are the human name with spaces
 //! turned into underscores, UTF-8 preserved (e.g. `São_Paulo_Grand_Prix`).
 
-use super::archive::{Archive, Session};
+use super::archive::{Archive, SCHEDULE_MAX_BYTES, Session, atomic_write, read_limited};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
@@ -24,6 +24,8 @@ pub struct ScheduledSession {
     pub name: String,
     /// This session's own date, `YYYY-MM-DD`.
     pub date: String,
+    /// UTC session start time when Jolpica provides it.
+    pub time: Option<String>,
 }
 
 impl ScheduledSession {
@@ -213,6 +215,7 @@ struct JolpicaRace {
     #[serde(rename = "Circuit")]
     circuit: Circuit,
     date: String,
+    time: Option<String>,
     #[serde(rename = "FirstPractice")]
     first_practice: Option<DateEntry>,
     #[serde(rename = "SecondPractice")]
@@ -243,6 +246,7 @@ struct Location {
 #[derive(Deserialize)]
 struct DateEntry {
     date: String,
+    time: Option<String>,
 }
 
 impl JolpicaRace {
@@ -254,27 +258,41 @@ impl JolpicaRace {
                 sessions.push(ScheduledSession {
                     name: feed.to_string(),
                     date: e.date,
+                    time: e.time,
                 });
             }
         };
         push("Practice 1", self.first_practice);
-        // Sprint weekends: SprintQualifying/Shootout sets the grid for the sprint.
-        push(
-            "Sprint Qualifying",
-            self.sprint_qualifying.or(self.sprint_shootout),
-        );
+        // Preserve the historical feed names because the name is part of the
+        // static archive folder path (2023 Shootout, 2024+ Qualifying).
+        push("Sprint Shootout", self.sprint_shootout);
+        push("Sprint Qualifying", self.sprint_qualifying);
         push("Practice 2", self.second_practice);
         push("Sprint", self.sprint);
         push("Practice 3", self.third_practice);
         push("Qualifying", self.qualifying);
+        let race_date = self.date.clone();
         sessions.push(ScheduledSession {
             name: "Race".to_string(),
             date: self.date,
+            time: self.time,
+        });
+        sessions.sort_by(|a, b| {
+            (
+                a.date.as_str(),
+                a.time.as_deref().unwrap_or("99:99:99Z"),
+                a.name.as_str(),
+            )
+                .cmp(&(
+                    b.date.as_str(),
+                    b.time.as_deref().unwrap_or("99:99:99Z"),
+                    b.name.as_str(),
+                ))
         });
         ScheduledRace {
             round: self.round.parse().unwrap_or(0),
             name: self.race_name,
-            race_date: sessions.last().unwrap().date.clone(),
+            race_date,
             circuit_id: self.circuit.circuit_id,
             locality: self.circuit.location.locality,
             country: self.circuit.location.country,
@@ -288,31 +306,16 @@ impl Archive {
     /// including seasons F1 has trimmed from its own index.
     pub async fn schedule(&self, year: u16) -> Result<Vec<ScheduledRace>> {
         let cache_file = self.schedule_cache_file(year);
-        let body = if let Ok(cached) = std::fs::read_to_string(&cache_file) {
-            cached
-        } else {
-            let url = format!("{JOLPICA}/{year}.json");
-            let body = self
-                .http()
-                .get(&url)
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await?;
-            std::fs::create_dir_all(cache_file.parent().unwrap())?;
-            std::fs::write(&cache_file, &body)?;
-            body
-        };
-        let resp: JolpicaResp = serde_json::from_str(&body)
-            .with_context(|| format!("parsing Jolpica schedule for {year}"))?;
-        Ok(resp
-            .mr_data
-            .race_table
-            .races
-            .into_iter()
-            .map(JolpicaRace::into_scheduled)
-            .collect())
+        if let Some(schedule) = read_cached_schedule(&cache_file, year)? {
+            return Ok(schedule);
+        }
+        let url = format!("{JOLPICA}/{year}.json");
+        let resp = self.http().get(&url).send().await?.error_for_status()?;
+        let body = read_limited(resp, SCHEDULE_MAX_BYTES).await?;
+        let body = String::from_utf8(body).context("Jolpica schedule is not UTF-8")?;
+        let schedule = parse_schedule(&body, year)?;
+        atomic_write(&cache_file, body.as_bytes())?;
+        Ok(schedule)
     }
 
     /// Turn a scheduled session into an archive `Session` the replay loader can use.
@@ -328,6 +331,39 @@ impl Archive {
             s.date.clone(),
             race.session_path(year, s),
         )
+    }
+}
+
+fn parse_schedule(body: &str, year: u16) -> Result<Vec<ScheduledRace>> {
+    let resp: JolpicaResp = serde_json::from_str(body)
+        .with_context(|| format!("parsing Jolpica schedule for {year}"))?;
+    Ok(resp
+        .mr_data
+        .race_table
+        .races
+        .into_iter()
+        .map(JolpicaRace::into_scheduled)
+        .collect())
+}
+
+fn read_cached_schedule(path: &std::path::Path, year: u16) -> Result<Option<Vec<ScheduledRace>>> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            std::fs::remove_file(path)
+                .with_context(|| format!("removing corrupt {}", path.display()))?;
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    match parse_schedule(&body, year) {
+        Ok(schedule) => Ok(Some(schedule)),
+        Err(_) => {
+            std::fs::remove_file(path)
+                .with_context(|| format!("removing corrupt {}", path.display()))?;
+            Ok(None)
+        }
     }
 }
 
@@ -347,10 +383,12 @@ mod tests {
                 ScheduledSession {
                     name: "Qualifying".into(),
                     date: "2024-07-06".into(),
+                    time: None,
                 },
                 ScheduledSession {
                     name: "Race".into(),
                     date: "2024-07-07".into(),
+                    time: None,
                 },
             ],
         }
@@ -511,9 +549,96 @@ mod tests {
         let s = ScheduledSession {
             name: "Race".into(),
             date: "2024-07-07".into(),
+            time: None,
         };
         assert!(s.is_available("2026-07-03"));
         assert!(s.is_available("2024-07-07"));
         assert!(!s.is_available("2024-07-06"));
+    }
+
+    fn historical_sprint(value: serde_json::Value) -> ScheduledRace {
+        serde_json::from_value::<JolpicaRace>(value)
+            .unwrap()
+            .into_scheduled()
+    }
+
+    #[test]
+    fn historical_sprint_2023_keeps_shootout_name_and_order() {
+        let race = historical_sprint(serde_json::json!({
+            "round": "4",
+            "raceName": "Azerbaijan Grand Prix",
+            "date": "2023-04-30",
+            "time": "11:00:00Z",
+            "Circuit": {
+                "circuitId": "baku",
+                "Location": {"locality": "Baku", "country": "Azerbaijan"}
+            },
+            "FirstPractice": {"date": "2023-04-28", "time": "09:30:00Z"},
+            "Qualifying": {"date": "2023-04-28", "time": "13:00:00Z"},
+            "SprintShootout": {"date": "2023-04-29", "time": "08:30:00Z"},
+            "Sprint": {"date": "2023-04-29", "time": "12:30:00Z"}
+        }));
+        assert_eq!(
+            race.sessions
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Practice 1",
+                "Qualifying",
+                "Sprint Shootout",
+                "Sprint",
+                "Race"
+            ]
+        );
+        let shootout = &race.sessions[2];
+        assert!(
+            race.session_path(2023, shootout)
+                .ends_with("2023/2023-04-30_Azerbaijan_Grand_Prix/2023-04-29_Sprint_Shootout/")
+        );
+    }
+
+    #[test]
+    fn historical_sprint_2024_uses_qualifying_name_and_order() {
+        let race = historical_sprint(serde_json::json!({
+            "round": "6",
+            "raceName": "Miami Grand Prix",
+            "date": "2024-05-05",
+            "time": "20:00:00Z",
+            "Circuit": {
+                "circuitId": "miami",
+                "Location": {"locality": "Miami", "country": "USA"}
+            },
+            "FirstPractice": {"date": "2024-05-03", "time": "16:30:00Z"},
+            "SprintQualifying": {"date": "2024-05-03", "time": "20:30:00Z"},
+            "Sprint": {"date": "2024-05-04", "time": "16:00:00Z"},
+            "Qualifying": {"date": "2024-05-04", "time": "20:00:00Z"}
+        }));
+        assert_eq!(
+            race.sessions
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Practice 1",
+                "Sprint Qualifying",
+                "Sprint",
+                "Qualifying",
+                "Race"
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_cached_schedule_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("2024.json");
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(read_cached_schedule(&path, 2024).unwrap().is_none());
+        assert!(!path.exists());
+
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(read_cached_schedule(&path, 2024).unwrap().is_none());
+        assert!(!path.exists());
     }
 }
